@@ -1,0 +1,4 @@
+14ac446e1695b0a70c4965d3e256d20671f1a2b8893b549e4ffa8ca352c4f401  bin/deploybundle-pack-linux-amd64
+9643709d3469a5ce6b8d8f24291291ea0c750e817ed3c670f0e206a0ea812fdd  bin/deploybundle-pack-linux-arm64
+786cd675b05bc2129906195d7555c134abb96beedb7ae8ac40708721dbefdd4d  bin/deploybundle-run-linux-amd64
+e18c770a772f5ade18cb08250883fd7af2b2ad29c945b0c155668c950610ea38  bin/deploybundle-run-linux-arm64
