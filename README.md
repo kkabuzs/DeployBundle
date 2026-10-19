@@ -104,6 +104,43 @@ curl --fail http://127.0.0.1:8080/
 
 `create` 不会自动拉取私有 registry 镜像，也不支持只有 `build` 没有 `image` 的服务。打包后的 Compose 会固定 `pull_policy: never`，部署时不会重新拉取镜像。`apply` 启动 Compose 后不会等待 HTTP 或 healthcheck 就绪，应用可用性需要由调用方检查。
 
+## 环境变量处理
+
+当前采用打包时固化环境变量的方式。`deploy-pack create` 调用 Docker Compose 的 `config --format json --no-normalize`，由打包端 Compose 解析 shell 环境变量、项目 `.env`、变量插值和服务 `env_file`。解析后的完整 Compose 会进入 `compose.enc`，部署主机不需要原始 `.env` 或 `env_file`。
+
+例如：
+
+```yaml
+services:
+  app:
+    image: example/app:1.0
+    env_file:
+      - ./production.env
+    environment:
+      APP_MODE: "${APP_MODE:?APP_MODE is required}"
+      DB_PASSWORD: "${DB_PASSWORD:?DB_PASSWORD is required}"
+```
+
+打包前准备变量：
+
+```bash
+set -a
+. ./production.env
+set +a
+
+./bin/deploybundle-pack-linux-amd64 create \
+  --compose ./compose.yaml \
+  --out ./release/prod-linux-amd64 \
+  --key-file ./key.bin \
+  --signing-key ./signing.seed \
+  --bundle-id prod-linux-amd64 \
+  --platform linux/amd64
+```
+
+`${VAR:?message}` 可让缺失变量在打包阶段直接失败。变量值会被加密保存在 `compose.enc` 中，并在 `apply` 时随已验证的 Compose 传给 Docker Compose。修改变量后需要重新生成 bundle；当前 CLI 没有单独的部署时 `--env-file` 注入模式。
+
+环境变量在 bundle 中是加密的，但持有对称密钥的人可以解密，Docker root 或 daemon 管理员也可以在容器启动后读取运行时环境。生产环境应限制 `production.env`、`key.bin` 和签名私钥的权限，并避免把它们提交到 Git。
+
 ## Bundle 内容
 
 ```text
@@ -236,7 +273,7 @@ GOCACHE=/tmp/deploybundle-gocache go test -count=1 -race ./...
 GOCACHE=/tmp/deploybundle-gocache go vet ./...
 ```
 
-测试包含加密流截断、nonce/frame 大小、manifest 签名校验、artifact 哈希、平台预检、Compose project 名冲突和 fake Docker CLI 端到端流程。
+测试包含加密流截断、nonce/frame 大小、manifest 签名校验、artifact 哈希、平台预检、Compose project 名冲突、环境变量快照和 fake Docker CLI 端到端流程。
 
 已完成的真实环境验证：
 

@@ -1,9 +1,9 @@
 # Codex 工作交接
 
-更新时间：2026-09-29
+更新时间：2026-10-19
 当前主机：本机 macOS
 项目路径：`/Users/dp/project/DeployBundle`
-当前分支：不适用（当前目录尚未初始化 Git）
+当前分支：`main`，HEAD `6ff8bde`，已推送到 `origin/main`
 
 ## 当前目标
 
@@ -11,13 +11,15 @@
 
 ## 已确认事实
 
-- 当前目录不是 Git 仓库；代码和本交接文件已经存在于 `/Users/dp/project/DeployBundle`。
+- 当前目录是 Git 仓库，远程为 `git@github.com:kkabuzs/DeployBundle.git`；代码和本交接文件位于 `/Users/dp/project/DeployBundle`。
 - 上一对话的设计要求是通用工具，默认面向 `host-integrated-v1`，需要保留 GPU、宿主机设备和宿主机路径语义。
 - 当前本机 Docker daemon 不可用，但 Docker Compose CLI v5.1.1 可执行。
 - Multipass `gitlab` VM 为 Ubuntu 24.04 ARM64，Docker Engine 29.7.1、Compose v5.4.0；真实 Docker daemon 可用（VM 内需 `sudo`）。
 - 已在 `gitlab` VM 用 `nginx:1.30.5` 完成一次真实 `docker save`、`docker load`、`docker compose up` 闭环；HTTP 请求返回 200，容器保持 running。
 - 已在同一 VM 用 nginx 和 `pgsty/silo` 两个 ARM64 镜像完成真实打包、加载和 Compose 启动；nginx HTTP 返回 200，helper 容器退出码为 0。
 - Docker Compose v5.4.0 的 `pull_policy`、镜像平台和规范化 JSON 在该最小 Compose 上通过。
+- 已在用户提供的远程服务器 `101.200.219.174` 完成 Linux AMD64 真实验证：Docker Engine 28.1.1、Docker Compose v5.5.1；服务器现有 `docker.1ms.run/library/redis:7.2.6-alpine` 镜像为 Linux AMD64。
+- 远程测试使用唯一 Compose project、独立网络、无宿主机端口映射、无宿主机挂载、无 host network 和无 privileged；测试前后现有容器、网络和卷的 ID/名称/镜像基线无差异。
 
 ## 基于证据的判断
 
@@ -44,6 +46,11 @@
 - 按 `<项目名>-<命令>-<系统>-<架构>` 规范构建四个 Linux 发布物：`deploybundle-pack/run-linux-amd64/arm64`，并生成 `bin/SHA256SUMS`；旧命名 ARM64 文件已移除。
 - 按 GitHub 开源项目风格重写 `README.md`，补充快速开始、双架构发布、CLI 参数、验证边界、安全说明、贡献指南和许可证状态；文档中的发布物名称、校验命令和真实 VM 结果已与当前实现对齐。
 - 添加标准 `LICENSE` 文件，项目许可证改为 Apache License 2.0，并在 README 中建立引用。
+- 按方案 A 固化 Compose 环境变量：打包端通过 Docker Compose `config --format json --no-normalize` 解析 shell 变量、`.env`、变量插值和 `env_file`，解析后的 Compose 加密进入 `compose.enc`；README 已补充使用说明。
+- 新增 `TestCLIEnvironmentSnapshot`，使用真实 Docker Compose CLI 验证 shell 变量和 `env_file` 值进入加密 Compose，并在 `apply` 时完整传递给 Compose。
+- 在远程服务器 `/root/gotest` 完成 `keygen`、`create`、`inspect`、`verify`、`apply` 闭环；Redis 容器内 `redis-cli ping` 返回 `PONG`。
+- 远程错误密钥验证和单字节篡改验证均按预期失败；测试容器、网络、匿名卷、临时镜像 tag、密钥、bundle 和测试目录已清理，`/root/gotest` 恢复为空。
+- 远程 Docker Hub 的 `nginx:1.30.5` 拉取因网络超时失败，未留下 nginx 镜像；因此远程闭环使用服务器现有 Redis 镜像完成。
 - 单元、竞态和静态检查均通过。
 - 实现 Docker Compose JSON 解析、镜像检查/tag/save 流程和 host-integrated 能力摘要。
 
@@ -88,6 +95,12 @@ shasum -a 256 bin/deploybundle-*-linux-* > bin/SHA256SUMS  通过
 VM（Multipass `gitlab`，Docker Engine 29.7.1 / Compose v5.4.0）：
 `deploy-pack create`、`deploy-run inspect`、`deploy-run verify`、`deploy-run apply` 通过；VM 内 `curl http://127.0.0.1:18180/` 返回 nginx 页面（HTTP 200）。
 双镜像 Compose（nginx + `pgsty/silo`）同样通过；helper 容器退出码为 0，原有 `gitlab`/`silo` 容器保持运行。
+
+远程服务器（`101.200.219.174`，Linux AMD64，Docker Engine 28.1.1 / Compose v5.5.1）：
+`deploy-pack keygen`、`create`、`deploy-run inspect`、`verify`、`apply` 通过；`docker load` 加载 bundle 内 Redis 镜像，独立 Compose project 启动成功，容器内 `redis-cli ping` 返回 `PONG`。
+错误密钥和篡改后的镜像 artifact 均被 `verify` 拒绝；清理后测试容器、网络、卷和临时 tag 均不存在，`/root/gotest` 为空。
+
+环境变量集成测试：`TestCLIEnvironmentSnapshot` 通过；shell 变量和 `env_file` 值在 `compose.enc` 解密后存在，密文不包含测试明文，`apply` 传给 Compose 的 JSON 保持一致。
 ```
 
 ## 未解决问题

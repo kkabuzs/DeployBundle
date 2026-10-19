@@ -136,6 +136,142 @@ func TestCLIRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCLIEnvironmentSnapshot(t *testing.T) {
+	realDocker, err := exec.LookPath("docker")
+	if err != nil {
+		t.Skip("Docker CLI is required for Compose environment interpolation")
+	}
+	root := moduleRoot(t)
+	work := t.TempDir()
+
+	archiveSource := filepath.Join(work, "archive.tar")
+	if err := os.WriteFile(archiveSource, []byte("fake docker archive\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	envFile := filepath.Join(work, "runtime.env")
+	if err := os.WriteFile(envFile, []byte("FROM_ENV_FILE=from-env-file\nSECRET_FROM_FILE=secret-value\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(work, "compose.yaml")
+	compose := `services:
+  web:
+    image: nginx:latest
+    env_file:
+      - ./runtime.env
+    environment:
+      FROM_SHELL: "${DEPLOYBUNDLE_TEST_SHELL:?DEPLOYBUNDLE_TEST_SHELL is required}"
+      INLINE_VALUE: direct
+`
+	if err := os.WriteFile(composePath, []byte(compose), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeDocker := filepath.Join(work, "fake-docker")
+	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	loadOutput := filepath.Join(work, "loaded-archive.tar")
+	composeOutput := filepath.Join(work, "applied-compose.json")
+	fakeEnv := []string{
+		"REAL_DOCKER_BIN=" + realDocker,
+		"FAKE_COMPOSE_CONFIG=" + composePath,
+		"FAKE_ARCHIVE_SOURCE=" + archiveSource,
+		"FAKE_LOAD_OUTPUT=" + loadOutput,
+		"FAKE_COMPOSE_OUTPUT=" + composeOutput,
+		"FAKE_IMAGE_OS=" + runtime.GOOS,
+		"FAKE_IMAGE_ARCH=" + runtime.GOARCH,
+		"DEPLOYBUNDLE_TEST_SHELL=from-shell",
+	}
+
+	pack := filepath.Join(work, "deploy-pack")
+	run := filepath.Join(work, "deploy-run")
+	buildBinary(t, root, "./cmd/deploy-pack", pack, work)
+	buildBinary(t, root, "./cmd/deploy-run", run, work)
+
+	keyPath := filepath.Join(work, "key.bin")
+	privatePath := filepath.Join(work, "signing.seed")
+	publicPath := filepath.Join(work, "signing.pub")
+	runTool(t, root, fakeEnv, pack, "keygen", "--key-out", keyPath, "--signing-private-out", privatePath, "--signing-public-out", publicPath)
+
+	bundleDir := filepath.Join(work, "bundle")
+	platform := runtime.GOOS + "/" + runtime.GOARCH
+	runTool(t, root, fakeEnv, pack, "create", "--compose", composePath, "--out", bundleDir,
+		"--key-file", keyPath, "--signing-key", privatePath, "--bundle-id", "env-snapshot",
+		"--release", "test", "--platform", platform, "--docker", fakeDocker)
+
+	ciphertext, err := os.ReadFile(filepath.Join(bundleDir, "compose.enc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"from-shell", "from-env-file", "secret-value"} {
+		if bytes.Contains(ciphertext, []byte(value)) {
+			t.Fatalf("encrypted Compose contains plaintext environment value %q", value)
+		}
+	}
+
+	key, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	composeFile, err := os.Open(filepath.Join(bundleDir, "compose.enc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decrypted bytes.Buffer
+	if err := bundle.Decrypt(&decrypted, composeFile, key); err != nil {
+		_ = composeFile.Close()
+		t.Fatalf("decrypt packaged Compose: %v", err)
+	}
+	if err := composeFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	packagedEnv := composeEnvironment(t, decrypted.Bytes())
+	assertEnvironment(t, packagedEnv, "FROM_SHELL", "from-shell")
+	assertEnvironment(t, packagedEnv, "FROM_ENV_FILE", "from-env-file")
+	assertEnvironment(t, packagedEnv, "SECRET_FROM_FILE", "secret-value")
+	assertEnvironment(t, packagedEnv, "INLINE_VALUE", "direct")
+
+	runTool(t, root, fakeEnv, run, "apply", "--bundle", bundleDir, "--key-file", keyPath, "--verify-key", publicPath, "--docker", fakeDocker)
+	applied, err := os.ReadFile(composeOutput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appliedEnv := composeEnvironment(t, applied)
+	assertEnvironment(t, appliedEnv, "FROM_SHELL", "from-shell")
+	assertEnvironment(t, appliedEnv, "FROM_ENV_FILE", "from-env-file")
+	assertEnvironment(t, appliedEnv, "SECRET_FROM_FILE", "secret-value")
+	assertEnvironment(t, appliedEnv, "INLINE_VALUE", "direct")
+}
+
+func composeEnvironment(t *testing.T, raw []byte) map[string]any {
+	t.Helper()
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatalf("parse Compose JSON: %v", err)
+	}
+	services, ok := document["services"].(map[string]any)
+	if !ok {
+		t.Fatalf("Compose JSON has no services object: %s", raw)
+	}
+	web, ok := services["web"].(map[string]any)
+	if !ok {
+		t.Fatalf("Compose JSON has no web service: %s", raw)
+	}
+	environment, ok := web["environment"].(map[string]any)
+	if !ok {
+		t.Fatalf("Compose JSON has no environment map: %s", raw)
+	}
+	return environment
+}
+
+func assertEnvironment(t *testing.T, environment map[string]any, name, want string) {
+	t.Helper()
+	got, ok := environment[name].(string)
+	if !ok || got != want {
+		t.Fatalf("environment[%q] = %#v, want %q", name, environment[name], want)
+	}
+}
+
 func moduleRoot(t *testing.T) string {
 	t.Helper()
 	// The integration package lives directly below the module root.
@@ -190,6 +326,9 @@ case "${1:-}" in
       fi
     done
     if [ "$is_config" -eq 1 ]; then
+      if [ -n "${REAL_DOCKER_BIN:-}" ]; then
+        exec "$REAL_DOCKER_BIN" "$@"
+      fi
       cat "$FAKE_COMPOSE_CONFIG"
     else
       cat > "$FAKE_COMPOSE_OUTPUT"
