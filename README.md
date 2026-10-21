@@ -106,7 +106,7 @@ curl --fail http://127.0.0.1:8080/
 
 ## 环境变量处理
 
-当前采用打包时固化环境变量的方式。`deploy-pack create` 调用 Docker Compose 的 `config --format json --no-normalize`，由打包端 Compose 解析 shell 环境变量、项目 `.env`、变量插值和服务 `env_file`。解析后的完整 Compose 会进入 `compose.enc`，部署主机不需要原始 `.env` 或 `env_file`。
+当前采用打包时固化环境变量的方式。`deploy-pack create` 调用 Docker Compose 的 `config --format json --no-normalize`，由打包端 Compose 解析 shell 环境变量、项目 `.env`、变量插值和服务 `env_file`。解析后的完整 Compose 会进入 `compose.enc`，部署主机不需要原始 `.env` 或 `env_file`。没有环境变量时不传 `--env-file`，静态 Compose 可以直接打包。
 
 例如：
 
@@ -124,11 +124,8 @@ services:
 打包前准备变量：
 
 ```bash
-set -a
-. ./production.env
-set +a
-
 ./bin/deploybundle-pack-linux-amd64 create \
+  --env-file ./production.env \
   --compose ./compose.yaml \
   --out ./release/prod-linux-amd64 \
   --key-file ./key.bin \
@@ -137,7 +134,7 @@ set +a
   --platform linux/amd64
 ```
 
-`${VAR:?message}` 可让缺失变量在打包阶段直接失败。变量值会被加密保存在 `compose.enc` 中，并在 `apply` 时随已验证的 Compose 传给 Docker Compose。修改变量后需要重新生成 bundle；当前 CLI 没有单独的部署时 `--env-file` 注入模式。
+`${VAR:?message}` 可让缺失变量在打包阶段直接失败。变量值会被加密保存在 `compose.enc` 中，并在 `apply` 时随已验证的 Compose 传给 Docker Compose。修改变量后需要重新生成 bundle。`--env-file` 只用于打包阶段的 Compose 解析，`apply` 不提供部署时重新注入环境文件的模式；也可以通过 shell 环境变量或 Compose 自动加载的 `.env` 提供变量。
 
 环境变量在 bundle 中是加密的，但持有对称密钥的人可以解密，Docker root 或 daemon 管理员也可以在容器启动后读取运行时环境。生产环境应限制 `production.env`、`key.bin` 和签名私钥的权限，并避免把它们提交到 Git。
 
@@ -225,6 +222,7 @@ DOCKER_CONTEXT=prod-arm64 ./bin/deploybundle-pack-linux-arm64 create \
 | 参数 | 说明 |
 | --- | --- |
 | `--compose` | 输入 Compose 文件；每个服务必须已有 `image` |
+| `--env-file` | 可选，打包阶段用于 Compose 变量插值的环境文件 |
 | `--out` | 新的 bundle 目录；已存在时命令拒绝覆盖 |
 | `--key-file` / `--signing-key` | AES 对称密钥和 Ed25519 私钥 |
 | `--platform` | 目标 OS/架构，例如 `linux/amd64`；默认取当前 Go 运行时 |

@@ -12,8 +12,11 @@ import (
 // Config asks the installed Docker Compose CLI to resolve a Compose file to JSON.
 // Using the Compose CLI keeps YAML parsing and Compose interpolation semantics in
 // the same implementation that will later start the package.
-func Config(ctx context.Context, dockerBin, path, project string) (map[string]any, error) {
+func Config(ctx context.Context, dockerBin, path, project, envFile string) (map[string]any, error) {
 	args := []string{"compose"}
+	if envFile != "" {
+		args = append(args, "--env-file", envFile)
+	}
 	if project != "" {
 		args = append(args, "--project-name", project)
 	}

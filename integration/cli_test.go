@@ -134,6 +134,13 @@ func TestCLIRoundTrip(t *testing.T) {
 	if !strings.Contains(string(applied), "pull_policy") || !strings.Contains(string(applied), "bundle.local/cli-roundtrip") {
 		t.Fatalf("applied Compose was not rewritten for local images: %s", applied)
 	}
+	log, err := os.ReadFile(logOutput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(log), "--env-file") {
+		t.Fatalf("no-env create unexpectedly passed --env-file: %s", log)
+	}
 }
 
 func TestCLIEnvironmentSnapshot(t *testing.T) {
@@ -152,6 +159,10 @@ func TestCLIEnvironmentSnapshot(t *testing.T) {
 	if err := os.WriteFile(envFile, []byte("FROM_ENV_FILE=from-env-file\nSECRET_FROM_FILE=secret-value\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	packEnvFile := filepath.Join(work, "pack.env")
+	if err := os.WriteFile(packEnvFile, []byte("FROM_PACK_FILE=from-pack-env\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	composePath := filepath.Join(work, "compose.yaml")
 	compose := `services:
   web:
@@ -159,6 +170,7 @@ func TestCLIEnvironmentSnapshot(t *testing.T) {
     env_file:
       - ./runtime.env
     environment:
+      FROM_PACK_FILE: "${FROM_PACK_FILE:?FROM_PACK_FILE is required}"
       FROM_SHELL: "${DEPLOYBUNDLE_TEST_SHELL:?DEPLOYBUNDLE_TEST_SHELL is required}"
       INLINE_VALUE: direct
 `
@@ -197,13 +209,13 @@ func TestCLIEnvironmentSnapshot(t *testing.T) {
 	platform := runtime.GOOS + "/" + runtime.GOARCH
 	runTool(t, root, fakeEnv, pack, "create", "--compose", composePath, "--out", bundleDir,
 		"--key-file", keyPath, "--signing-key", privatePath, "--bundle-id", "env-snapshot",
-		"--release", "test", "--platform", platform, "--docker", fakeDocker)
+		"--release", "test", "--platform", platform, "--docker", fakeDocker, "--env-file", packEnvFile)
 
 	ciphertext, err := os.ReadFile(filepath.Join(bundleDir, "compose.enc"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, value := range []string{"from-shell", "from-env-file", "secret-value"} {
+	for _, value := range []string{"from-pack-env", "from-shell", "from-env-file", "secret-value"} {
 		if bytes.Contains(ciphertext, []byte(value)) {
 			t.Fatalf("encrypted Compose contains plaintext environment value %q", value)
 		}
@@ -226,6 +238,7 @@ func TestCLIEnvironmentSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	packagedEnv := composeEnvironment(t, decrypted.Bytes())
+	assertEnvironment(t, packagedEnv, "FROM_PACK_FILE", "from-pack-env")
 	assertEnvironment(t, packagedEnv, "FROM_SHELL", "from-shell")
 	assertEnvironment(t, packagedEnv, "FROM_ENV_FILE", "from-env-file")
 	assertEnvironment(t, packagedEnv, "SECRET_FROM_FILE", "secret-value")
@@ -237,6 +250,7 @@ func TestCLIEnvironmentSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	appliedEnv := composeEnvironment(t, applied)
+	assertEnvironment(t, appliedEnv, "FROM_PACK_FILE", "from-pack-env")
 	assertEnvironment(t, appliedEnv, "FROM_SHELL", "from-shell")
 	assertEnvironment(t, appliedEnv, "FROM_ENV_FILE", "from-env-file")
 	assertEnvironment(t, appliedEnv, "SECRET_FROM_FILE", "secret-value")

@@ -54,7 +54,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `Usage:
   deploy-pack keygen --key-out key.bin --signing-private-out signing.seed --signing-public-out signing.pub
-  deploy-pack create --compose compose.yaml --out bundle-dir --key-file key.bin --signing-key signing.seed
+  deploy-pack create --compose compose.yaml --out bundle-dir --key-file key.bin --signing-key signing.seed [--env-file env-file]
 
 create reads image references from Compose using Docker Compose, tags them with
 bundle-local names, exports all images in one docker archive, and writes signed
@@ -85,6 +85,7 @@ func runKeygen(args []string) error {
 
 type createOptions struct {
 	composePath string
+	envFile     string
 	outDir      string
 	keyFile     string
 	signingKey  string
@@ -104,6 +105,7 @@ func runCreate(args []string) error {
 	fs.SetOutput(io.Discard)
 	o := createOptions{}
 	fs.StringVar(&o.composePath, "compose", "", "input Compose file")
+	fs.StringVar(&o.envFile, "env-file", "", "optional Compose interpolation environment file")
 	fs.StringVar(&o.outDir, "out", "", "output bundle directory")
 	fs.StringVar(&o.keyFile, "key-file", "", "32-byte symmetric key")
 	fs.StringVar(&o.signingKey, "signing-key", "", "Ed25519 seed/private key")
@@ -122,6 +124,15 @@ func runCreate(args []string) error {
 	for name, value := range map[string]string{"--compose": o.composePath, "--out": o.outDir, "--key-file": o.keyFile, "--signing-key": o.signingKey} {
 		if value == "" {
 			return fmt.Errorf("%s is required", name)
+		}
+	}
+	if o.envFile != "" {
+		info, err := os.Stat(o.envFile)
+		if err != nil {
+			return fmt.Errorf("--env-file: %w", err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("--env-file must be a file: %s", o.envFile)
 		}
 	}
 	if o.compression != "gzip" && o.compression != "none" {
@@ -151,7 +162,7 @@ func createBundle(ctx context.Context, o createOptions, key []byte, privateKey e
 		return err
 	}
 	sourceHash := bundle.SHA256Hex(sourceCompose)
-	config, err := compose.Config(ctx, o.dockerBin, o.composePath, o.project)
+	config, err := compose.Config(ctx, o.dockerBin, o.composePath, o.project, o.envFile)
 	if err != nil {
 		return err
 	}
