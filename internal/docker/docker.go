@@ -35,13 +35,3 @@ func Inspect(ctx context.Context, dockerBin, ref string) (ImageInspect, error) {
 	}
 	return list[0], nil
 }
-
-func Tag(ctx context.Context, dockerBin, ref, tag string) error {
-	cmd := exec.CommandContext(ctx, dockerBin, "tag", ref, tag)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("docker tag %q %q failed: %w: %s", ref, tag, err, stderr.String())
-	}
-	return nil
-}

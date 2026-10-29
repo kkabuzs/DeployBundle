@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/openai/deploybundle/internal/binding"
 	"github.com/openai/deploybundle/internal/files"
@@ -36,7 +38,7 @@ func main() {
 	case "apply":
 		err = runApply(os.Args[2:])
 	case "help", "-h", "--help":
-		usage()
+		printRootUsage(os.Stdout)
 		return
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
@@ -48,15 +50,80 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `Usage:
-  deploy-run inspect --bundle bundle-dir --verify-key signing.pub
-  deploy-run verify --bundle bundle-dir --key-file key.bin --verify-key signing.pub
-  deploy-run apply --bundle bundle-dir --key-file key.bin --verify-key signing.pub
+	printRootUsage(os.Stderr)
+}
 
-verify authenticates the manifest, validates artifact hashes, decrypts the
-Compose and image streams without writing plaintext files, and checks gzip
-integrity. apply additionally authenticates the complete image archive before
-passing it to docker load, then sends the verified Compose to docker compose.`)
+func printRootUsage(w io.Writer) {
+	fmt.Fprintln(w, `用法：
+  deploy-run inspect [参数]
+  deploy-run verify [参数]
+  deploy-run apply [参数]
+  deploy-run --help
+
+命令：
+  inspect   读取并显示 Bundle 清单，不解密镜像
+  verify    验证签名、哈希、加密流和主机预检
+  apply     验证 Bundle、加载镜像并启动 Compose
+
+使用“deploy-run <命令> --help”查看具体参数说明。`)
+}
+
+func helpRequested(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+	}
+	return false
+}
+
+func printInspectUsage(w io.Writer) {
+	fmt.Fprintln(w, `用法：
+  deploy-run inspect --bundle bundle-dir --verify-key signing.pub
+
+参数：
+  --bundle PATH             Bundle 目录
+  --verify-key PATH         Ed25519 验签公钥
+  --allow-platform-mismatch 允许 Bundle 目标平台与当前主机不同
+  --skip-host-preflight     跳过 GPU、设备和宿主机路径预检
+  --docker PATH             Docker CLI 路径，默认 docker
+  -h, --help                显示此帮助
+
+说明：inspect 只读取 Bundle，不启动服务。`)
+}
+
+func printVerifyUsage(w io.Writer) {
+	fmt.Fprintln(w, `用法：
+  deploy-run verify --bundle bundle-dir --key-file key.bin --verify-key signing.pub
+
+参数：
+  --bundle PATH             Bundle 目录
+  --key-file PATH           32 字节对称解密密钥
+  --verify-key PATH         Ed25519 验签公钥
+  --allow-platform-mismatch 允许 Bundle 目标平台与当前主机不同
+  --skip-host-preflight     跳过 GPU、设备和宿主机路径预检
+  --docker PATH             Docker CLI 路径，默认 docker
+  -h, --help                显示此帮助
+
+说明：verify 会验证 manifest、artifact 哈希、加密流、Compose 和主机能力，但不会启动 Compose。`)
+}
+
+func printApplyUsage(w io.Writer) {
+	fmt.Fprintln(w, `用法：
+  deploy-run apply --bundle bundle-dir --key-file key.bin --verify-key signing.pub [参数]
+
+参数：
+  --bundle PATH             Bundle 目录
+  --key-file PATH           32 字节对称解密密钥
+  --verify-key PATH         Ed25519 验签公钥
+  --assets-dir PATH         持久化 Compose 资产根目录，默认 /var/lib/deploybundle/assets
+  --service NAME            只启动指定 Compose 服务，可重复指定
+  --allow-platform-mismatch 允许 Bundle 目标平台与当前主机不同
+  --skip-host-preflight     跳过 GPU、设备和宿主机路径预检
+  --docker PATH             Docker CLI 路径，默认 docker
+  -h, --help                显示此帮助
+
+说明：apply 会先完整验证并解密 Bundle，再加载镜像并启动 Compose；不会比较客户机已有镜像 ID；失败时不会自动删除已加载镜像或回滚持久化数据。`)
 }
 
 type runOptions struct {
@@ -64,8 +131,27 @@ type runOptions struct {
 	keyFile       string
 	verifyKey     string
 	dockerBin     string
+	assetsDir     string
+	services      stringList
 	allowPlatform bool
 	skipHostCheck bool
+}
+
+type stringList []string
+
+func (values *stringList) String() string { return strings.Join(*values, ",") }
+
+func (values *stringList) Set(value string) error {
+	if !utf8.ValidString(value) || strings.ContainsRune(value, 0) || value == "" || strings.TrimSpace(value) != value || strings.HasPrefix(value, "-") {
+		return fmt.Errorf("invalid service name %q", value)
+	}
+	for _, existing := range *values {
+		if existing == value {
+			return fmt.Errorf("duplicate service %q", value)
+		}
+	}
+	*values = append(*values, value)
+	return nil
 }
 
 func parseRunOptions(args []string, command string, needSecret bool) (runOptions, error) {
@@ -76,10 +162,17 @@ func parseRunOptions(args []string, command string, needSecret bool) (runOptions
 	fs.StringVar(&o.keyFile, "key-file", "", "32-byte symmetric key")
 	fs.StringVar(&o.verifyKey, "verify-key", "", "Ed25519 public key")
 	fs.StringVar(&o.dockerBin, "docker", "docker", "Docker CLI executable")
+	if command == "apply" {
+		fs.StringVar(&o.assetsDir, "assets-dir", "/var/lib/deploybundle/assets", "persistent root for packaged Compose assets")
+		fs.Var(&o.services, "service", "Compose service to start (repeatable)")
+	}
 	fs.BoolVar(&o.allowPlatform, "allow-platform-mismatch", false, "allow manifest target platform to differ from runtime")
 	fs.BoolVar(&o.skipHostCheck, "skip-host-preflight", false, "skip GPU/device/path preflight")
 	if err := fs.Parse(args); err != nil {
 		return o, err
+	}
+	if fs.NArg() != 0 {
+		return o, fmt.Errorf("unexpected positional arguments: %q", fs.Args())
 	}
 	if o.bundleDir == "" || o.verifyKey == "" {
 		return o, errors.New("--bundle and --verify-key are required")
@@ -91,6 +184,10 @@ func parseRunOptions(args []string, command string, needSecret bool) (runOptions
 }
 
 func runInspect(args []string) error {
+	if helpRequested(args) {
+		printInspectUsage(os.Stdout)
+		return nil
+	}
 	o, err := parseRunOptions(args, "inspect", false)
 	if err != nil {
 		return err
@@ -99,15 +196,33 @@ func runInspect(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("bundleId: %s\nrelease: %s\nprofile: %s\ntarget: %s/%s\nimages: %d\n", m.BundleID, m.ReleaseVersion, m.Profile, m.TargetPlatform.OS, m.TargetPlatform.Architecture, len(m.Images))
+	fmt.Printf("bundleId: %s\nrelease: %s\nbundleType: %s\nupdateKind: %s\nprofile: %s\ntarget: %s/%s\nimages: %d\n", m.BundleID, m.ReleaseVersion, m.BundleType, m.UpdateKind, m.Profile, m.TargetPlatform.OS, m.TargetPlatform.Architecture, len(m.Images))
+	if m.BundleType == "delta" {
+		fmt.Printf("base: %s/%s\nrequired images: %d\n", m.BaseBundleID, m.BaseRelease, len(m.RequiredImages))
+	}
 	for _, image := range m.Images {
 		fmt.Printf("  %s: %s -> %s\n", image.Service, image.OriginalRef, image.LocalTag)
 	}
 	fmt.Printf("gpu requirements: %d, devices: %d, host paths: %d\n", len(m.Capabilities.GPU), len(m.Capabilities.Devices), len(m.Capabilities.HostPaths))
+	if m.SchemaVersion == 2 || len(m.Assets) > 0 {
+		var assetBytes int64
+		for _, asset := range m.Assets {
+			assetBytes += asset.Bytes
+		}
+		if m.Payload.AssetsArtifact == "" {
+			fmt.Printf("assets: %d\nasset bytes: %d\nasset artifact: reused from %s\n", len(m.Assets), assetBytes, m.AssetsBaseManifest)
+		} else {
+			fmt.Printf("schemaVersion: %d\nassets: %d\nasset bytes: %d\nasset artifact bytes: %d\n", m.SchemaVersion, len(m.Assets), assetBytes, m.Payload.AssetsBytes)
+		}
+	}
 	return nil
 }
 
 func runVerify(args []string) error {
+	if helpRequested(args) {
+		printVerifyUsage(os.Stdout)
+		return nil
+	}
 	o, err := parseRunOptions(args, "verify", true)
 	if err != nil {
 		return err
@@ -120,6 +235,9 @@ func runVerify(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := verifyArtifacts(m, o.bundleDir, key); err != nil {
+		return err
+	}
 	if err := checkPlatform(m, o.allowPlatform); err != nil {
 		return err
 	}
@@ -131,14 +249,15 @@ func runVerify(args []string) error {
 			return err
 		}
 	}
-	if err := verifyArtifacts(m, o.bundleDir, key); err != nil {
-		return err
-	}
 	fmt.Println("bundle signature, artifact hashes, encrypted streams, and host preflight verified")
 	return nil
 }
 
 func runApply(args []string) error {
+	if helpRequested(args) {
+		printApplyUsage(os.Stdout)
+		return nil
+	}
 	o, err := parseRunOptions(args, "apply", true)
 	if err != nil {
 		return err
@@ -151,6 +270,38 @@ func runApply(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := verifyArtifactHashes(m, o.bundleDir); err != nil {
+		return err
+	}
+	composeBytes, err := decryptCompose(m, o.bundleDir, key)
+	if err != nil {
+		return fmt.Errorf("decrypt Compose preflight: %w", err)
+	}
+	if bundle.SHA256Hex(composeBytes) != m.Compose.PackagedSHA256 || int64(len(composeBytes)) != m.Compose.Bytes {
+		return errors.New("decrypted Compose hash or length does not match manifest")
+	}
+	if err := validateSelectedServices(composeBytes, o.services); err != nil {
+		return err
+	}
+	var imageArchive *os.File
+	if len(m.Images) > 0 {
+		imageArchive, err = materializeImages(m, o.bundleDir, key)
+		if err != nil {
+			return fmt.Errorf("decrypt image archive preflight: %w", err)
+		}
+		defer func() {
+			name := imageArchive.Name()
+			_ = imageArchive.Close()
+			_ = os.Remove(name)
+		}()
+	}
+	workingDir := ""
+	if len(m.Assets) > 0 {
+		workingDir, err = materializeAssets(m, o.bundleDir, key, o.assetsDir)
+		if err != nil {
+			return fmt.Errorf("materialize Compose assets: %w", err)
+		}
+	}
 	if err := checkPlatform(m, o.allowPlatform); err != nil {
 		return err
 	}
@@ -162,32 +313,33 @@ func runApply(args []string) error {
 			return err
 		}
 	}
-	if err := verifyArtifactHashes(m, o.bundleDir); err != nil {
-		return err
+	if imageArchive != nil {
+		if err := loadImages(context.Background(), imageArchive, o.dockerBin); err != nil {
+			return err
+		}
 	}
-	composeBytes, err := decryptCompose(m, o.bundleDir, key)
-	if err != nil {
-		return fmt.Errorf("decrypt Compose preflight: %w", err)
-	}
-	if bundle.SHA256Hex(composeBytes) != m.Compose.PackagedSHA256 || int64(len(composeBytes)) != m.Compose.Bytes {
-		return errors.New("decrypted Compose hash or length does not match manifest")
-	}
-	imageArchive, err := materializeImages(m, o.bundleDir, key)
-	if err != nil {
-		return fmt.Errorf("decrypt image archive preflight: %w", err)
-	}
-	defer func() {
-		name := imageArchive.Name()
-		_ = imageArchive.Close()
-		_ = os.Remove(name)
-	}()
-	if err := loadImages(context.Background(), imageArchive, o.dockerBin); err != nil {
-		return err
-	}
-	if err := startCompose(context.Background(), m, composeBytes, o.dockerBin); err != nil {
+	if err := startCompose(context.Background(), m, composeBytes, o.dockerBin, workingDir, o.services); err != nil {
 		return err
 	}
 	fmt.Printf("bundle %s applied\n", m.BundleID)
+	return nil
+}
+
+func validateSelectedServices(composeBytes []byte, selected []string) error {
+	var model struct {
+		Services map[string]json.RawMessage `json:"services"`
+	}
+	if err := json.Unmarshal(composeBytes, &model); err != nil {
+		return fmt.Errorf("parse verified Compose model: %w", err)
+	}
+	if len(model.Services) == 0 {
+		return errors.New("verified Compose model has no services")
+	}
+	for _, service := range selected {
+		if _, ok := model.Services[service]; !ok {
+			return fmt.Errorf("service %q is not present in the packaged Compose model", service)
+		}
+	}
 	return nil
 }
 
@@ -258,18 +410,21 @@ func verifyArtifacts(m *bundle.Manifest, dir string, key []byte) error {
 	if bundle.SHA256Hex(composeBytes) != m.Compose.PackagedSHA256 || int64(len(composeBytes)) != m.Compose.Bytes {
 		return errors.New("decrypted Compose hash or length does not match manifest")
 	}
-	if err := verifyImagesStream(m, dir, key); err != nil {
-		return err
+	if m.Payload.ImagesArtifact != "" {
+		if err := verifyImagesStream(m, dir, key); err != nil {
+			return err
+		}
+	}
+	if m.Payload.AssetsArtifact != "" {
+		if err := verifyAssetsStream(m, dir, key); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func verifyArtifactHashes(m *bundle.Manifest, dir string) error {
 	composePath, err := artifactPath(dir, m.Payload.ComposeArtifact)
-	if err != nil {
-		return err
-	}
-	imagesPath, err := artifactPath(dir, m.Payload.ImagesArtifact)
 	if err != nil {
 		return err
 	}
@@ -280,12 +435,31 @@ func verifyArtifactHashes(m *bundle.Manifest, dir string) error {
 	if composeHash != m.Compose.EncryptedSHA256 || composeBytes != m.Compose.EncryptedBytes {
 		return errors.New("encrypted Compose artifact hash or length does not match manifest")
 	}
-	imageHash, imageBytes, err := files.SHA256(imagesPath)
-	if err != nil {
-		return err
+	if m.Payload.ImagesArtifact != "" {
+		imagesPath, err := artifactPath(dir, m.Payload.ImagesArtifact)
+		if err != nil {
+			return err
+		}
+		imageHash, imageBytes, err := files.SHA256(imagesPath)
+		if err != nil {
+			return err
+		}
+		if imageHash != m.Payload.ImagesSHA256 || imageBytes != m.Payload.ImagesBytes {
+			return errors.New("encrypted image artifact hash or length does not match manifest")
+		}
 	}
-	if imageHash != m.Payload.ImagesSHA256 || imageBytes != m.Payload.ImagesBytes {
-		return errors.New("encrypted image artifact hash or length does not match manifest")
+	if m.Payload.AssetsArtifact != "" {
+		assetsPath, err := artifactPath(dir, m.Payload.AssetsArtifact)
+		if err != nil {
+			return err
+		}
+		assetHash, assetBytes, err := files.SHA256(assetsPath)
+		if err != nil {
+			return err
+		}
+		if assetHash != m.Payload.AssetsSHA256 || assetBytes != m.Payload.AssetsBytes {
+			return errors.New("encrypted assets artifact hash or length does not match manifest")
+		}
 	}
 	return nil
 }
@@ -519,23 +693,32 @@ func loadImages(ctx context.Context, archive *os.File, dockerBin string) error {
 	return nil
 }
 
-func startCompose(ctx context.Context, m *bundle.Manifest, composeBytes []byte, dockerBin string) error {
+func startCompose(ctx context.Context, m *bundle.Manifest, composeBytes []byte, dockerBin, projectDirectory string, services []string) error {
 	project := sanitizeProject(m.BundleID)
-	cmd := exec.CommandContext(ctx, dockerBin, "compose", "--project-name", project, "-f", "-", "up", "-d", "--pull", "never")
+	args := []string{"compose", "--project-name", project}
+	if projectDirectory != "" {
+		args = append(args, "--project-directory", projectDirectory)
+	}
+	args = append(args, "-f", "-", "up", "-d", "--pull", "never")
+	args = append(args, services...)
+	cmd := exec.CommandContext(ctx, dockerBin, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
 	}
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start docker compose: %w", err)
 	}
 	h := sha256.New()
 	_, writeErr := io.Copy(io.MultiWriter(stdin, h), bytes.NewReader(composeBytes))
-	_ = stdin.Close()
+	closeErr := stdin.Close()
 	waitErr := cmd.Wait()
 	if writeErr != nil {
 		return writeErr
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	if "sha256:"+hex.EncodeToString(h.Sum(nil)) != m.Compose.PackagedSHA256 {
 		return errors.New("decrypted Compose hash changed before apply")
