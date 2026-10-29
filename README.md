@@ -1,187 +1,237 @@
 # DeployBundle
 
-DeployBundle 是一个与业务项目无关的 Docker Compose 离线交付工具。它从 Compose 文件读取服务镜像，把多个本地镜像导出到一个 bundle，使用 AES-256-GCM 分块加密，并用 Ed25519 签名 manifest。目标主机上的 `deploy-run` 会先验证签名、哈希和加密流，再加载镜像并启动 Compose。
+DeployBundle 是一个离线交付工具：把 Docker Compose、镜像归档和可选的项目内配置文件加密，使用签名 manifest 描述内容，交给目标主机验证并启动 Compose。
 
-## 功能
+它解决的是交付内容的保密和完整性问题。运行端不把客户 Docker 主机当成必须与发布端完全一致的镜像基线系统。
 
-- 从 `services.*.image` 自动发现服务镜像。
-- 检查镜像的 OS 和 CPU 架构，并支持一次打包多个镜像。
-- 使用一次 `docker save` 生成镜像归档，支持 `gzip`（默认）或不压缩。
-- 使用 `AES-256-GCM-chunked-v2` 分块加密；`verify` 流式解密不写入明文文件，`apply` 只在完整认证后写入权限为 0600 的临时归档。
-- 使用 Ed25519 签名 manifest，manifest 同时记录 Compose 和加密 artifact 的 SHA-256。
-- `inspect`、`verify`、`apply` 分阶段执行；`apply` 在完整认证镜像归档后才调用 `docker load`。
-- 对目标平台、设备文件和绝对宿主机路径执行预检。
-- 可选使用带随机 salt 的 MAC 地址绑定。
+## 运行模型
 
-## 工作流程
+发布端执行：
 
 ```text
-Compose + 本地 Docker images
-             │
-             ▼
-      deploy-pack create
-             │
-             ▼
- manifest.json + manifest.sig + encrypted artifacts
-             │
-             ▼
-      deploy-run inspect / verify / apply
-             │
-             ▼
-   verified docker load + docker compose up -d
+Compose + Docker 本地镜像
+        │
+        ▼
+deploy-pack create
+        │
+        ▼
+manifest.json + manifest.sig + 加密 artifact
 ```
 
-## 环境要求
+目标主机执行：
 
-打包端和部署端都需要：
-
-- Docker CLI；
-- Docker Compose plugin；
-- 对应 Docker daemon 的访问权限。
-
-`deploy-pack create` 需要 Compose plugin 和 Docker daemon，因为它会解析 Compose、检查镜像并执行 `docker save`。`deploy-run inspect` 和 `deploy-run verify` 只读取 bundle、验证密钥和执行本地预检，不调用 Docker daemon；`deploy-run apply` 需要 Docker daemon。
-
-从源码构建需要 Go 1.27 或更高版本。当前发布目标为 Linux `amd64` 和 `arm64`。每个 bundle 只对应一个目标平台，打包端必须使用与目标 Docker daemon 一致的镜像和 `--platform`。
-
-## 快速开始
-
-下面的示例以 Linux ARM64 为例。先准备一个最小 Compose 文件，并确保镜像已经存在于打包端的 Docker daemon：
-
-```bash
-mkdir -p demo-work
-cat > demo-work/compose.yaml <<'YAML'
-services:
-  web:
-    image: nginx:1.30.5
-    ports:
-      - "8080:80"
-YAML
-
-docker pull nginx:1.30.5
+```text
+deploy-run inspect / verify / apply
+        │
+        ├─ 验证 manifest 签名和 artifact 哈希
+        ├─ 解密并验证 Compose
+        ├─ 有镜像 artifact 时执行 docker load
+        └─ docker compose ... up -d --pull never
 ```
 
-准备密钥并创建 bundle。`--out` 指向的目录必须不存在：
+运行端不会比较客户机已有镜像的 `localImageId`，也不会使用 `baseManifestSha256` 拒绝更新。镜像是否能被 Compose 使用，由本地镜像标签和 Docker Compose 自身判断。
 
-```bash
-PACK=./bin/deploybundle-pack-linux-arm64
-RUN=./bin/deploybundle-run-linux-arm64
+## Bundle 类型
 
-"$PACK" keygen \
-  --key-out demo-work/key.bin \
-  --signing-private-out demo-work/signing.seed \
-  --signing-public-out demo-work/signing.pub
+- **完整 Bundle**：包含 Compose 和全部镜像。用于首次部署、完整回退或客户机没有可靠本地镜像的场景。
+- **config-only 增量 Bundle**：不包含镜像 artifact，适合只改 Compose、环境变量或资产引用的更新。`config-only` 表示本次没有携带镜像，不限定变化一定只有环境变量。
+- **mixed 增量 Bundle**：包含完整最终 Compose 和本次变化的镜像 artifact；未变化镜像不重复传输。
 
-"$PACK" create \
-  --compose demo-work/compose.yaml \
-  --out demo-work/release/demo-linux-arm64 \
-  --key-file demo-work/key.bin \
-  --signing-key demo-work/signing.seed \
-  --bundle-id demo-linux-arm64 \
-  --release 2026.09.29 \
-  --profile host-integrated-v1 \
-  --platform linux/arm64
-```
+`--base-bundle` 和 `--base-manifest` 只在发布端用于筛选变化镜像和复用未变化资产。它们不会在客户机上形成镜像 ID 锁。增量 manifest 中的 `requiredImages` 是签名的打包和审计元数据，运行端不拿它比较客户 Docker 状态。
 
-在目标 ARM64 主机上验证并部署：
+## 镜像标签
 
-```bash
-"$RUN" inspect \
-  --bundle demo-work/release/demo-linux-arm64 \
-  --verify-key demo-work/signing.pub
-
-"$RUN" verify \
-  --bundle demo-work/release/demo-linux-arm64 \
-  --key-file demo-work/key.bin \
-  --verify-key demo-work/signing.pub
-
-"$RUN" apply \
-  --bundle demo-work/release/demo-linux-arm64 \
-  --key-file demo-work/key.bin \
-  --verify-key demo-work/signing.pub
-
-curl --fail http://127.0.0.1:8080/
-```
-
-`create` 不会自动拉取私有 registry 镜像，也不支持只有 `build` 没有 `image` 的服务。打包后的 Compose 会固定 `pull_policy: never`，部署时不会重新拉取镜像。`apply` 启动 Compose 后不会等待 HTTP 或 healthcheck 就绪，应用可用性需要由调用方检查。
-
-## 环境变量处理
-
-当前采用打包时固化环境变量的方式。`deploy-pack create` 调用 Docker Compose 的 `config --format json --no-normalize`，由打包端 Compose 解析 shell 环境变量、项目 `.env`、变量插值和服务 `env_file`。解析后的完整 Compose 会进入 `compose.enc`，部署主机不需要原始 `.env` 或 `env_file`。没有环境变量时不传 `--env-file`，静态 Compose 可以直接打包。
-
-例如：
+新 Bundle 默认把 Compose 的原始 `image` 引用作为运行时镜像引用，并固定写入：
 
 ```yaml
-services:
-  app:
-    image: example/app:1.0
-    env_file:
-      - ./production.env
-    environment:
-      APP_MODE: "${APP_MODE:?APP_MODE is required}"
-      DB_PASSWORD: "${DB_PASSWORD:?DB_PASSWORD is required}"
+pull_policy: never
 ```
 
-打包前准备变量：
+这样目标机不会因为更新而联网拉取镜像。有镜像更新时，随包的加密 archive 由 `docker load` 加载；只有配置更新时，Compose 使用目标机已有的本地标签。
+
+基于旧 Bundle 生成配置-only 更新时，如果服务的原始引用和镜像内容没有变化，打包端会保留旧 Bundle 使用的标签，以兼容已经加载的历史 Bundle。旧标签不会因为升级 runner 自动迁移。
+
+## 密钥和资产路径
+
+Bundle 使用两个不同用途的密钥文件：
+
+- `key.bin`：AES 对称加密密钥；
+- `signing.pub`：目标机验签公钥；
+- `signing.seed`：仅发布端使用的 Ed25519 私钥。
+
+每个 Bundle 的 `key.bin` 和 `signing.pub` 内容必须与该 Bundle 的加密和签名信息匹配。路径可以保持不变，但更换密钥不是普通配置更新，需要用新密钥重新生成并交付 Bundle。
+
+带资产的 Bundle 使用 `--assets-dir` 指定持久化资产根目录，默认值为：
+
+```text
+/var/lib/deploybundle/assets
+```
+
+如果增量 Bundle 的 manifest 包含 `assetsBaseManifestSha256`，它没有自己的资产 archive，`apply` 时必须在这个根目录下找到并通过校验对应的旧资产目录。`verify` 只验证随包携带的 artifact，不代表被引用的旧资产目录已经存在；资产引用是否可用由 `apply` 检查。
+
+## 环境变量
+
+环境变量在发布端固化到加密 Compose 中。`--env-file` 只用于打包阶段，目标机不需要原始 `.env` 或 `env_file` 文件：
 
 ```bash
 ./bin/deploybundle-pack-linux-amd64 create \
-  --env-file ./production.env \
   --compose ./compose.yaml \
-  --out ./release/prod-linux-amd64 \
-  --key-file ./key.bin \
-  --signing-key ./signing.seed \
-  --bundle-id prod-linux-amd64 \
+  --env-file ./production.env \
+  --out ./release/prod-cpu \
+  --key-file ./keys/key.bin \
+  --signing-key ./keys/signing.seed \
+  --bundle-id prod-cpu \
+  --release 2026.10.29 \
   --platform linux/amd64
 ```
 
-`${VAR:?message}` 可让缺失变量在打包阶段直接失败。变量值会被加密保存在 `compose.enc` 中，并在 `apply` 时随已验证的 Compose 传给 Docker Compose。修改变量后需要重新生成 bundle。`--env-file` 只用于打包阶段的 Compose 解析，`apply` 不提供部署时重新注入环境文件的模式；也可以通过 shell 环境变量或 Compose 自动加载的 `.env` 提供变量。
+修改环境变量后重新生成 Bundle。持有 `key.bin` 的人可以解密 Compose；Docker root 或 daemon 管理员可以读取运行时环境。该工具不是 DRM。
 
-环境变量在 bundle 中是加密的，但持有对称密钥的人可以解密，Docker root 或 daemon 管理员也可以在容器启动后读取运行时环境。生产环境应限制 `production.env`、`key.bin` 和签名私钥的权限，并避免把它们提交到 Git。
+## 生成 Bundle
 
-## Bundle 内容
+先生成密钥：
+
+```bash
+./bin/deploybundle-pack-linux-amd64 keygen \
+  --key-out ./keys/key.bin \
+  --signing-private-out ./keys/signing.seed \
+  --signing-public-out ./keys/signing.pub
+```
+
+生成完整 Bundle：
+
+```bash
+./bin/deploybundle-pack-linux-amd64 create \
+  --compose ./compose.yaml \
+  --out ./release/prod-cpu-full \
+  --key-file ./keys/key.bin \
+  --signing-key ./keys/signing.seed \
+  --bundle-id prod-cpu \
+  --release 2026.10.29-full \
+  --platform linux/amd64
+```
+
+基于上一版 manifest 生成增量 Bundle：
+
+```bash
+./bin/deploybundle-pack-linux-amd64 create \
+  --compose ./compose.yaml \
+  --out ./release/prod-cpu-2026.10.29 \
+  --key-file ./keys/key.bin \
+  --signing-key ./keys/signing.seed \
+  --bundle-id prod-cpu \
+  --release 2026.10.29 \
+  --base-manifest ./release/prod-cpu-full/manifest.json \
+  --platform linux/amd64
+```
+
+`--base-bundle` 读取完整旧 Bundle；`--base-manifest` 只读取旧 `manifest.json`。两者都只影响发布端筛选变化镜像，必须使用相同的 `bundle-id` 和目标平台。
+
+如果只需要为另一套 Compose 环境重新加密配置，而镜像完全复用已有完整 Bundle，可以使用 `--reuse-images-from PATH` 生成独立完整 Bundle。该参数复用源完整 Bundle 的加密镜像 archive，并重新生成 Compose、manifest 和签名；它与 `--base-bundle`、`--base-manifest` 互斥。
+
+如果需要加密打包 Compose 项目内的相对 bind、`configs.file` 或 `secrets.file` 文件，增加：
+
+```bash
+--package-assets
+```
+
+资产只接受项目目录内的普通文件，manifest 记录路径、哈希、大小和权限。绝对宿主机路径和 named volume 仍由目标主机提供。
+
+## 验证和应用
+
+检查清单摘要：
+
+```bash
+./bin/deploybundle-run-linux-amd64 inspect \
+  --bundle ./release/prod-cpu-2026.10.29 \
+  --verify-key ./keys/signing.pub
+```
+
+验证签名、artifact、解密流和宿主机预检：
+
+```bash
+./bin/deploybundle-run-linux-amd64 verify \
+  --bundle ./release/prod-cpu-2026.10.29 \
+  --key-file ./keys/key.bin \
+  --verify-key ./keys/signing.pub
+```
+
+应用 Bundle：
+
+```bash
+./bin/deploybundle-run-linux-amd64 apply \
+  --bundle ./release/prod-cpu-2026.10.29 \
+  --key-file ./keys/key.bin \
+  --verify-key ./keys/signing.pub \
+  --assets-dir /var/lib/deploybundle/assets
+```
+
+`--service NAME` 可以重复，用于只启动已验证 Compose 模型中的指定服务。不传时保持 Compose 的全量启动语义。`--skip-host-preflight` 只适合受控测试；客户 GPU 部署应保留默认预检。
+
+同一服务栈应保持稳定的 `bundle-id`，因为 runner 会根据它生成 Compose project 名。`bundle-id` 是项目身份，不是镜像标签或镜像 ID。
+
+## CPU/GPU 更新顺序
+
+跨主机 GPU 部署时，通常先应用 CPU Bundle，再应用 GPU Bundle。每个 Bundle 都要单独执行 `verify` 和 `apply`。如果是 config-only 更新，不会传输或加载镜像；如果是 mixed 更新，只加载本次 artifact 中的镜像。
+
+## 回滚
+
+回滚就是用相同的 runner 重新 `apply` 目标版本 Bundle：
+
+```bash
+./bin/deploybundle-run-linux-amd64 verify \
+  --bundle ./release/prod-cpu-previous \
+  --key-file ./keys/key.bin \
+  --verify-key ./keys/signing.pub
+
+./bin/deploybundle-run-linux-amd64 apply \
+  --bundle ./release/prod-cpu-previous \
+  --key-file ./keys/key.bin \
+  --verify-key ./keys/signing.pub \
+  --assets-dir /var/lib/deploybundle/assets
+```
+
+回滚能恢复目标 Bundle 中的 Compose、它携带的镜像和它携带或引用的资产，具体取决于该 Bundle 的内容：
+
+- 旧完整 Bundle 携带全部镜像，适合作为完整镜像回退包；
+- 旧 config-only Bundle 不携带镜像，不能单独恢复后来被覆盖的镜像内容；
+- 旧 mixed Bundle 只能恢复它实际携带的变化镜像；
+- 引用旧资产的 Bundle 仍要求对应资产目录存在。
+
+回滚不会恢复数据库、Docker volume 或其他持久化数据，也不会自动执行 `down`、`prune` 或清理其他项目。Compose 启动不是事务，失败后可能留下部分容器状态。
+
+## Bundle 内容和安全边界
+
+典型 Bundle：
 
 ```text
-release/demo-linux-arm64/
+release/prod-cpu-2026.10.29/
 ├── manifest.json
 ├── manifest.sig
 ├── compose.enc
-└── images.tar.gzip.enc
+├── images.tar.gzip.enc    # 完整包或 mixed 增量包可选
+└── assets.tar.gzip.enc    # 可选
 ```
 
-`manifest.json` 包含：
+manifest 签名覆盖 Bundle 描述、Compose 摘要、镜像元数据、资产元数据、目标平台和宿主机能力摘要。AES-GCM 加密流和 artifact SHA-256 用于发现密文替换、截断和篡改。
 
-- bundle ID、发行版本、运行时 profile 和目标平台；
-- 原始 Compose 与规范化 Compose 的 SHA-256；
-- 每个服务的原始镜像引用、镜像 ID、rootfs layer ID 和 bundle 内本地 tag；
-- GPU、设备文件和宿主机路径摘要；
-- 加密算法、压缩方式、chunk size 和加密 artifact 哈希；
-- 签名算法和签名 key ID。
+`requiredImages`、`baseManifestSha256` 和 `localImageId` 可以存在于增量 manifest 中，但它们是结构、审计和打包筛选信息，不是客户机镜像状态锁。`assetsBaseManifestSha256` 不同：它表示资产不在本包中，`apply` 必须从 `--assets-dir` 找到并校验对应资产目录。
 
-manifest 使用规范化 JSON 签名。`manifest.sig`、`compose.enc` 和镜像 artifact 被替换或截断时，`verify` 和 `apply` 都会失败。
+当前支持 schema 1、2、3：schema 1 为无资产完整包，schema 2 为带完整资产 artifact 的完整包，schema 3 为增量包。manifest 结构、签名、公钥和加密流版本仍会严格校验。
 
-## 双架构发布
-
-发布物名称遵循：
+## 发布二进制
 
 ```text
-<project>-<command>-<os>-<arch>
+bin/deploybundle-pack-linux-amd64
+bin/deploybundle-pack-linux-arm64
+bin/deploybundle-run-linux-amd64
+bin/deploybundle-run-linux-arm64
+bin/SHA256SUMS
 ```
 
-当前项目的发布物为：
-
-```text
-bin/
-├── deploybundle-pack-linux-amd64
-├── deploybundle-pack-linux-arm64
-├── deploybundle-run-linux-amd64
-├── deploybundle-run-linux-arm64
-└── SHA256SUMS
-```
-
-在任意支持 Go 交叉编译的平台上构建：
+构建并校验：
 
 ```bash
-mkdir -p bin
 for arch in amd64 arm64; do
   GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
     GOCACHE=/tmp/deploybundle-gocache \
@@ -195,132 +245,31 @@ for arch in amd64 arm64; do
 done
 
 shasum -a 256 bin/deploybundle-*-linux-* > bin/SHA256SUMS
+shasum -a 256 -c bin/SHA256SUMS
 ```
 
-macOS 可使用 `shasum -a 256 -c bin/SHA256SUMS` 校验；Linux 可使用 `sha256sum -c bin/SHA256SUMS`。发布时应同时发布校验文件。
-
-两个架构使用不同的原生二进制和不同的 bundle；单个二进制不会同时变成 amd64/arm64 可执行文件。`--platform` 只声明并检查目标平台，不会自动选择多架构镜像。例如可以为两个 Docker context 分别打包：
-
-```bash
-DOCKER_CONTEXT=prod-amd64 ./bin/deploybundle-pack-linux-amd64 create \
-  --compose compose.yaml --out release/prod-linux-amd64 \
-  --key-file key.bin --signing-key signing.seed \
-  --bundle-id prod-linux-amd64 --platform linux/amd64
-
-DOCKER_CONTEXT=prod-arm64 ./bin/deploybundle-pack-linux-arm64 create \
-  --compose compose.yaml --out release/prod-linux-arm64 \
-  --key-file key.bin --signing-key signing.seed \
-  --bundle-id prod-linux-arm64 --platform linux/arm64
-```
-
-部署时使用与主机架构匹配的 `deploy-run` 和 bundle。`--allow-platform-mismatch` 只应在已确认 Docker 实际目标平台匹配时使用。
-
-## CLI 参数要点
-
-`deploy-pack create` 的常用参数：
-
-| 参数 | 说明 |
-| --- | --- |
-| `--compose` | 输入 Compose 文件；每个服务必须已有 `image` |
-| `--env-file` | 可选，打包阶段用于 Compose 变量插值的环境文件 |
-| `--out` | 新的 bundle 目录；已存在时命令拒绝覆盖 |
-| `--key-file` / `--signing-key` | AES 对称密钥和 Ed25519 私钥 |
-| `--platform` | 目标 OS/架构，例如 `linux/amd64`；默认取当前 Go 运行时 |
-| `--compression` | `gzip` 或 `none`，默认 `gzip` |
-| `--chunk-size` | 加密 chunk 大小，默认 1 MiB，允许 4 KiB 至 64 MiB |
-| `--docker` | Docker CLI 可执行文件路径，默认 `docker` |
-| `--project-name` | 传给 Compose 的项目名 |
-| `--bind-mac` | 可选，逗号分隔的部署主机 MAC 地址 |
-
-`deploy-run verify/apply` 还支持 `--docker`、`--allow-platform-mismatch` 和 `--skip-host-preflight`。`--skip-host-preflight` 只适合受控测试，不能替代目标主机检查。
-
-密钥文件包含敏感材料，`keygen` 会覆盖同名输出文件；请在安全目录中生成，并避免提交到 Git。
-
-## Compose 与宿主机资源
-
-MVP 不重写 Compose 的运行语义，只替换已打包服务的 `image` 并加入 `pull_policy: never`。以下字段会保留在规范化 Compose 中，并在 manifest 中形成摘要：
-
-- `deploy.resources.reservations.devices`；
-- `devices`；
-- bind mount；
-- `network_mode: host`；
-- `pid: host`；
-- `privileged`。
-
-当前 `host-integrated-v1` 预检只确认声明的设备文件和绝对宿主机路径存在，不验证 GPU 驱动、权限、端口冲突或更细的危险路径策略。`apply` 失败后不会自动卸载已加载镜像，也没有自动回滚；需要由部署系统决定清理和重试策略。
-
-源 Compose 的 `--project-name` 不会原样决定部署项目名。runner 会根据 bundle ID 生成带 hash 后缀的 Compose project 名，以降低不同 bundle 之间的名称冲突。
-
-## 加密与安全边界
-
-- 加密格式为 `AES-256-GCM-chunked-v2`，流头魔数为 `DBAE2`；每条流使用随机 96 位前缀，并为每个 frame 派生 nonce，终止帧也经过认证。
-- Ed25519 签名覆盖规范化 manifest；artifact SHA-256 用于发现文件替换和截断。
-- 当前 runner 拒绝旧 v1 加密流；旧 bundle 需要重新打包。
-- MAC 绑定保存的是带随机 salt 的哈希，只是额外的部署条件，不会改变 Docker 管理员的读取能力。
-- 持有对称密钥的人可以离线解密；Docker root 或 daemon 管理员可以在运行时读取镜像和 Compose。该工具不是 DRM。
-- 当前 MVP 没有过期、撤销、外部 secrets/configs、密钥轮换或 registry 凭据管理能力。
-
-不要把 `key.bin`、`signing.seed` 或其他私钥材料提交到 Git、bundle 或日志中。
-
-## 测试与验证
-
-运行单元测试、集成测试和竞态检测：
+## 测试
 
 ```bash
 GOCACHE=/tmp/deploybundle-gocache go test -count=1 -race ./...
 GOCACHE=/tmp/deploybundle-gocache go vet ./...
+git diff --check
 ```
 
-测试包含加密流截断、nonce/frame 大小、manifest 签名校验、artifact 哈希、平台预检、Compose project 名冲突、环境变量快照和 fake Docker CLI 端到端流程。
+集成测试覆盖完整 Bundle、config-only 和 mixed 增量包、环境变量固化、资产加密、legacy 标签兼容、签名和 artifact 篡改，以及 apply 阶段不依赖客户机镜像 ID 检查。
 
-已完成的真实环境验证：
+## 当前限制
 
-- Multipass VM 名称：`gitlab`；Ubuntu 24.04、Linux ARM64、Docker Engine 29.7.1、Docker Compose v5.4.0；
-- `nginx:1.30.5` 单镜像 bundle 完成 `create`、`inspect`、`verify`、`apply`，随后手动请求返回 HTTP 200；
-- `nginx:1.30.5` 与 `pgsty/silo:RELEASE.2026-09-16T00-00-00Z` 双镜像 bundle 均成功 `docker load`，nginx 返回 HTTP 200，helper 容器退出码为 0；
-- 测试产生的容器、网络、临时 tag、key、bundle 和测试目录已清理，VM 原有容器和基础镜像保留。
+- 每个 Bundle 只对应一个目标平台；
+- 服务必须已有 `image`，不支持只有 `build` 的服务；
+- 不自动拉取私有 registry 镜像；
+- 不提供数据库、volume 或业务数据回滚；
+- 不提供 GPU 驱动、端口冲突和完整权限策略的自动诊断；
+- 不支持外部 secrets/configs 的独立密钥管理；
+- Docker root 或 daemon 管理员可以读取运行时内容。
 
-以上真实闭环覆盖 ARM64、默认 gzip 和普通 Compose 服务；没有覆盖 AMD64 实机运行、GPU、宿主机设备、bind mount、MAC 绑定、端口冲突和 `--compression none`。AMD64 发布物已完成交叉编译和 ELF 架构检查，仍需在 AMD64 VM 或 CI runner 中做运行时验证。
-
-## 项目结构
-
-```text
-cmd/deploy-pack/   # keygen、create
-cmd/deploy-run/    # inspect、verify、apply
-internal/          # Compose、Docker、文件、密钥和宿主机绑定实现
-pkg/bundle/        # manifest、规范化 JSON 和加密流格式
-integration/       # fake Docker CLI 集成测试
-```
-
-## 当前限制与后续计划
-
-当前不支持：
-
-- 只有 `build` 没有 `image` 的 Compose 服务；
-- 自动拉取私有 registry 镜像；
-- 直接输入 OCI archive；
-- 外部 secrets/configs、许可证撤销和密钥轮换；
-- 完整 GPU 驱动、权限和端口冲突预检；
-- 单个发布物同时兼容两种 CPU 架构。
-
-后续可在保持现有 bundle 基本格式的前提下增加 OCI 输入、zstd、许可证签发、密钥轮换和更完整的宿主机能力检查。
-
-## 贡献
-
-欢迎提交 issue 和 pull request。修改 bundle 格式、CLI 参数或安全边界时，请同时更新：
-
-1. `README.md` 和命令帮助；
-2. 对应单元测试或集成测试；
-3. 加密格式、manifest schema 或兼容性说明。
-
-提交前运行：
-
-```bash
-gofmt -w $(rg --files -g '*.go' cmd internal pkg integration)
-GOCACHE=/tmp/deploybundle-gocache go test -count=1 -race ./...
-GOCACHE=/tmp/deploybundle-gocache go vet ./...
-```
+不要把 `key.bin`、`signing.seed`、访问令牌或其他私密材料提交到 Git、Bundle 或日志中。
 
 ## 许可证
 
-本项目采用 [Apache License 2.0](./LICENSE)。使用、修改和再分发本项目时，请遵守许可证中的版权、专利、NOTICE 和免责声明条款。
+本项目采用 [Apache License 2.0](./LICENSE)。
