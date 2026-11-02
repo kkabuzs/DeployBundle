@@ -142,7 +142,18 @@ func materializeAssets(m *bundle.Manifest, dir string, key []byte, assetsDir str
 		copy(digest[:], decoded)
 	} else {
 		var err error
-		digest, err = bundle.ManifestDigest(m)
+		if m.BundleType == "full" && m.UpdateKind == "config-only" {
+			// Standalone configuration releases carry their own assets. Keep
+			// unchanged bind paths stable when only Compose or release changes.
+			var data []byte
+			data, err = bundle.MarshalCanonical(m.Assets)
+			if err == nil {
+				digest = sha256.Sum256(data)
+			}
+		} else {
+			// Legacy bundles retain their existing manifest-based directory.
+			digest, err = bundle.ManifestDigest(m)
+		}
 		if err != nil {
 			return "", err
 		}

@@ -2,12 +2,18 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/openai/deploybundle/internal/assets"
+	"github.com/openai/deploybundle/pkg/bundle"
 )
 
 func TestHelpIsChineseAndAvailableBeforeRequiredArguments(t *testing.T) {
@@ -46,6 +52,124 @@ func TestRunCreateRejectsInvalidComposeProfilesAndPositionals(t *testing.T) {
 		if err := runCreate(args); err == nil {
 			t.Fatalf("invalid create arguments accepted: %v", extra)
 		}
+	}
+}
+
+func TestRunCreateRejectsRemovedImageOptions(t *testing.T) {
+	for _, name := range []string{"base-bundle", "base-manifest", "reuse-images-from"} {
+		t.Run(name, func(t *testing.T) {
+			err := runCreate([]string{"--" + name, "old-bundle"})
+			if err == nil || !strings.Contains(err.Error(), "--"+name+" has been removed") {
+				t.Fatalf("removed option error = %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateConfigBundlePreservesComposeWithoutImageOperations(t *testing.T) {
+	root := t.TempDir()
+	composePath := filepath.Join(root, "compose.json")
+	model := map[string]any{
+		"services": map[string]any{
+			"api": map[string]any{
+				"image":       "private.invalid/api:new-version",
+				"pull_policy": "always",
+				"environment": map[string]any{"ENDPOINT": "config-canary"},
+			},
+			"db": map[string]any{
+				"image":   "private.invalid/database:existing",
+				"volumes": []any{map[string]any{"type": "volume", "source": "data", "target": "/data"}},
+			},
+		},
+		"volumes":  map[string]any{"data": map[string]any{"name": "existing_database_data"}},
+		"networks": map[string]any{"default": map[string]any{"name": "existing_network"}},
+	}
+	plain, err := json.Marshal(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(composePath, plain, 0600); err != nil {
+		t.Fatal(err)
+	}
+	dockerPath := filepath.Join(root, "docker")
+	logPath := filepath.Join(root, "docker.log")
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$PACK_TEST_LOG"
+if [ "$1" != compose ]; then
+  echo 'image access must not occur while packaging Compose' >&2
+  exit 1
+fi
+cat "$PACK_TEST_COMPOSE"
+`
+	if err := os.WriteFile(dockerPath, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PACK_TEST_LOG", logPath)
+	t.Setenv("PACK_TEST_COMPOSE", composePath)
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte{0x37}, 32)
+	out := filepath.Join(root, "bundle")
+	err = createBundle(context.Background(), createOptions{
+		composePath: composePath, outDir: out, dockerBin: dockerPath,
+		bundleID: "config-test", release: "r1", profile: "host-integrated-v1",
+		compression: "gzip", chunkSize: 4096,
+	}, key, private, bundle.TargetPlatform{OS: "linux", Architecture: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(out, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := bundle.ParseManifest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.BundleType != "full" || m.UpdateKind != "config-only" || len(m.Images) != 0 || m.Payload.ImagesArtifact != "" || m.BaseManifest != "" || m.AssetsBaseManifest != "" {
+		t.Fatalf("unexpected config bundle metadata: %+v", m)
+	}
+	sig, err := os.ReadFile(filepath.Join(out, "manifest.sig"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bundle.VerifyManifest(m, sig, public); err != nil {
+		t.Fatal(err)
+	}
+	ciphertext, err := os.ReadFile(filepath.Join(out, "compose.enc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(ciphertext, []byte("config-canary")) {
+		t.Fatal("Compose environment appeared in plaintext")
+	}
+	var decrypted bytes.Buffer
+	if err := bundle.Decrypt(&decrypted, bytes.NewReader(ciphertext), key); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(decrypted.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, model) {
+		t.Fatalf("packaging changed Compose: got %s", decrypted.String())
+	}
+	entries, err := os.ReadDir(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("config-only bundle has %d files, want manifest/signature/compose", len(entries))
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(log), "\n") != 1 || !strings.HasPrefix(string(log), "compose ") {
+		t.Fatalf("unexpected Docker operations: %s", log)
 	}
 }
 

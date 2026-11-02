@@ -115,6 +115,53 @@ func TestParseRunOptionsServices(t *testing.T) {
 	}
 }
 
+func TestUpdateImagesIsExplicitAndApplyOnly(t *testing.T) {
+	args := []string{"--bundle", "bundle", "--key-file", "key", "--verify-key", "pub"}
+	o, err := parseRunOptions(args, "apply", true)
+	if err != nil || o.updateImages {
+		t.Fatalf("default image update = %v, error = %v", o.updateImages, err)
+	}
+	o, err = parseRunOptions(append(args, "--update-images"), "apply", true)
+	if err != nil || !o.updateImages {
+		t.Fatalf("explicit image update = %v, error = %v", o.updateImages, err)
+	}
+	for _, command := range []string{"inspect", "verify"} {
+		if _, err := parseRunOptions(append(args, "--update-images"), command, true); err == nil {
+			t.Fatalf("%s accepted apply-only --update-images", command)
+		}
+	}
+}
+
+func TestPrepareImageArchiveUsesPlainTarBeforeLegacyArtifact(t *testing.T) {
+	dir := t.TempDir()
+	data := []byte("docker save test archive")
+	path := filepath.Join(dir, "images.tar")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := &bundle.Manifest{Payload: bundle.PayloadSpec{ImagesArtifact: "missing-legacy.enc"}}
+	f, temporary, err := prepareImageArchive(m, dir, nil)
+	if err != nil || temporary || f == nil {
+		t.Fatalf("plain archive = %v, temporary = %v, err = %v", f, temporary, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("plain archive removed: %v", err)
+	}
+}
+
+func TestPrepareImageArchiveRejectsNonRegularFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "images.tar"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := prepareImageArchive(&bundle.Manifest{}, dir, nil); err == nil {
+		t.Fatal("images.tar directory was accepted")
+	}
+}
+
 func TestValidateSelectedServices(t *testing.T) {
 	model := []byte(`{"services":{"api":{},"worker":{}}}`)
 	if err := validateSelectedServices(model, []string{"worker", "api"}); err != nil {
@@ -327,6 +374,42 @@ func TestMaterializeAssetsReusesBaseManifestDirectory(t *testing.T) {
 	}
 	if got != baseDir {
 		t.Fatalf("reused asset directory = %q, want %q", got, baseDir)
+	}
+}
+
+func TestStandaloneAssetsKeepPathAcrossConfigurationReleases(t *testing.T) {
+	dir := t.TempDir()
+	key := bytes.Repeat([]byte{0x41}, 32)
+	source := assetpkg.Source{Manifest: bundle.AssetArtifact{
+		Path: "assets/config.txt", SHA256: bundle.SHA256Hex([]byte("same")), Bytes: 4, Mode: 0600,
+	}, Data: []byte("same")}
+	var archive, encrypted bytes.Buffer
+	if err := assetpkg.WriteTar(&archive, []assetpkg.Source{source}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bundle.Encrypt(&encrypted, &archive, key, bundle.WithChunkSize(4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "assets.enc"), encrypted.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := runnerAssetManifest(source.Manifest, "assets.enc", encrypted.Bytes())
+	m.BundleType = "full"
+	m.UpdateKind = "config-only"
+	m.Images = nil
+	m.Payload.ImagesArtifact = ""
+	m.Payload.ImagesSHA256 = ""
+	m.Payload.ImagesBytes = 0
+	root := filepath.Join(t.TempDir(), "runtime")
+	first, err := materializeAssets(m, dir, key, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.ReleaseVersion = "changed-config-release"
+	m.Compose.PackagedSHA256 = bundle.SHA256Hex([]byte("new environment"))
+	second, err := materializeAssets(m, dir, key, root)
+	if err != nil || first != second {
+		t.Fatalf("asset path changed with release: %q -> %q, error = %v", first, second, err)
 	}
 }
 

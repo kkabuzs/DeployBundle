@@ -100,6 +100,129 @@ func TestManifestRejectsInvalidUpdateKind(t *testing.T) {
 	}
 }
 
+func TestStandaloneConfigManifestRoundTrip(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, withAssets := range []bool{false, true} {
+		name := "compose"
+		if withAssets {
+			name = "compose-and-assets"
+		}
+		t.Run(name, func(t *testing.T) {
+			m := standaloneConfigManifestForTest(withAssets)
+			raw, err := MarshalManifest(m)
+			if err != nil {
+				t.Fatalf("standalone config rejected: %v", err)
+			}
+			sig, err := SignManifest(m, priv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := ParseManifest(raw)
+			if err != nil {
+				t.Fatalf("parse standalone config: %v", err)
+			}
+			if parsed.BundleType != "full" || parsed.UpdateKind != "config-only" || len(parsed.Images) != 0 || parsed.Payload.ImagesArtifact != "" || parsed.BaseManifest != "" {
+				t.Fatalf("unexpected standalone config metadata: %+v", parsed)
+			}
+			if err := VerifyManifest(parsed, sig, pub); err != nil {
+				t.Fatalf("verify standalone config: %v", err)
+			}
+			parsed.Compose.PackagedSHA256 = "sha256:changed"
+			if err := VerifyManifest(parsed, sig, pub); err == nil {
+				t.Fatal("modified standalone Compose metadata retained valid signature")
+			}
+		})
+	}
+}
+
+func TestStandaloneConfigManifestRejectsImageAndBaseMetadata(t *testing.T) {
+	checks := []struct {
+		name string
+		set  func(*Manifest)
+	}{
+		{name: "image set", set: func(m *Manifest) { m.Images = validManifestForTest().Images }},
+		{name: "image artifact", set: func(m *Manifest) { m.Payload.ImagesArtifact = "images.tar.gzip.enc" }},
+		{name: "image hash", set: func(m *Manifest) { m.Payload.ImagesSHA256 = testSHA('a') }},
+		{name: "image bytes", set: func(m *Manifest) { m.Payload.ImagesBytes = 1 }},
+		{name: "base bundle", set: func(m *Manifest) { m.BaseBundleID = "previous" }},
+		{name: "base release", set: func(m *Manifest) { m.BaseRelease = "r0" }},
+		{name: "base manifest", set: func(m *Manifest) { m.BaseManifest = testSHA('a') }},
+		{name: "base assets", set: func(m *Manifest) { m.AssetsBaseManifest = testSHA('a') }},
+		{name: "required images", set: func(m *Manifest) { m.RequiredImages = validManifestForTest().Images }},
+		{name: "delta schema", set: func(m *Manifest) { m.SchemaVersion = 3 }},
+	}
+	for _, check := range checks {
+		t.Run(check.name, func(t *testing.T) {
+			m := standaloneConfigManifestForTest(false)
+			check.set(m)
+			if err := m.Validate(); err == nil {
+				t.Fatalf("standalone config accepted %s", check.name)
+			}
+		})
+	}
+}
+
+func TestLegacyImageManifestRequiresArchiveMetadata(t *testing.T) {
+	for _, field := range []string{"artifact", "hash", "size"} {
+		t.Run(field, func(t *testing.T) {
+			m := validManifestForTest()
+			switch field {
+			case "artifact":
+				m.Payload.ImagesArtifact = ""
+			case "hash":
+				m.Payload.ImagesSHA256 = ""
+			case "size":
+				m.Payload.ImagesBytes = 0
+			}
+			if err := m.Validate(); err == nil {
+				t.Fatalf("legacy images accepted missing archive %s", field)
+			}
+		})
+	}
+}
+
+func TestLegacyFullAndDeltaManifestRoundTrip(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"implicit-full", "full", "mixed", "config-only"} {
+		t.Run(kind, func(t *testing.T) {
+			m := validManifestForTest()
+			switch kind {
+			case "full":
+				m.BundleType, m.UpdateKind = "full", "full"
+			case "mixed", "config-only":
+				m.SchemaVersion, m.BundleType, m.UpdateKind = 3, "delta", kind
+				m.BaseBundleID, m.BaseRelease, m.BaseManifest = "test", "r0", testSHA('a')
+				m.RequiredImages = append([]ImageArtifact(nil), m.Images...)
+				if kind == "config-only" {
+					m.Images = nil
+					m.Payload.ImagesArtifact, m.Payload.ImagesSHA256, m.Payload.ImagesBytes = "", "", 0
+				}
+			}
+			raw, err := MarshalManifest(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sig, err := SignManifest(m, priv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := ParseManifest(raw)
+			if err != nil {
+				t.Fatalf("legacy manifest rejected: %v", err)
+			}
+			if err := VerifyManifest(parsed, sig, pub); err != nil {
+				t.Fatalf("legacy manifest signature rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestParseManifestRejectsAssetFieldsInSchemaV1(t *testing.T) {
 	raw, err := MarshalManifest(validManifestForTest())
 	if err != nil {
@@ -147,6 +270,17 @@ func validAssetManifestForTest() *Manifest {
 	m.Payload.AssetsArtifact = "assets.tar.gzip.enc"
 	m.Payload.AssetsSHA256 = testSHA('b')
 	m.Payload.AssetsBytes = 128
+	return m
+}
+
+func standaloneConfigManifestForTest(withAssets bool) *Manifest {
+	m := validManifestForTest()
+	if withAssets {
+		m = validAssetManifestForTest()
+	}
+	m.BundleType, m.UpdateKind = "full", "config-only"
+	m.Images = []ImageArtifact{}
+	m.Payload.ImagesArtifact, m.Payload.ImagesSHA256, m.Payload.ImagesBytes = "", "", 0
 	return m
 }
 

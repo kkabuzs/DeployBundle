@@ -31,12 +31,12 @@ type Manifest struct {
 	Images             []ImageArtifact `json:"images"`
 	// RequiredImages is retained as signed packaging/audit metadata for delta
 	// Bundles. The runner does not require these images or compare their IDs.
-	RequiredImages     []ImageArtifact `json:"requiredImages,omitempty"`
-	Assets             []AssetArtifact `json:"assets,omitempty"`
-	Capabilities       Capabilities    `json:"capabilities"`
-	Binding            Binding         `json:"binding"`
-	Payload            PayloadSpec     `json:"payload"`
-	Signing            SigningSpec     `json:"signing"`
+	RequiredImages []ImageArtifact `json:"requiredImages,omitempty"`
+	Assets         []AssetArtifact `json:"assets,omitempty"`
+	Capabilities   Capabilities    `json:"capabilities"`
+	Binding        Binding         `json:"binding"`
+	Payload        PayloadSpec     `json:"payload"`
+	Signing        SigningSpec     `json:"signing"`
 }
 
 type TargetPlatform struct {
@@ -54,17 +54,17 @@ type ComposeArtifact struct {
 }
 
 type ImageArtifact struct {
-	Service          string   `json:"service"`
-	OriginalRef      string   `json:"originalRef"`
-	SourceRepoDigest string   `json:"sourceRepoDigest"`
+	Service          string `json:"service"`
+	OriginalRef      string `json:"originalRef"`
+	SourceRepoDigest string `json:"sourceRepoDigest"`
 	// LocalImageID is packaging metadata used to select changed images. The
 	// runner does not use it as a customer-host consistency lock.
-	LocalImageID     string   `json:"localImageId"`
-	RootfsDiffIDs    []string `json:"rootfsDiffIds"`
+	LocalImageID  string   `json:"localImageId"`
+	RootfsDiffIDs []string `json:"rootfsDiffIds"`
 	// LocalTag is the image reference written into the packaged Compose. New
 	// Bundles normally use OriginalRef; legacy-base updates may retain an old
 	// tag for unchanged images.
-	LocalTag         string   `json:"localTag"`
+	LocalTag string `json:"localTag"`
 }
 
 type AssetArtifact struct {
@@ -153,8 +153,9 @@ func (m *Manifest) Validate() error {
 	if m.UpdateKind != "" && m.UpdateKind != "full" && m.UpdateKind != "config-only" && m.UpdateKind != "mixed" {
 		return fmt.Errorf("unsupported updateKind %q", m.UpdateKind)
 	}
-	if bundleType == "full" && m.UpdateKind != "" && m.UpdateKind != "full" {
-		return errors.New("full bundle must use updateKind full")
+	standaloneConfig := bundleType == "full" && m.UpdateKind == "config-only"
+	if bundleType == "full" && m.UpdateKind != "" && m.UpdateKind != "full" && !standaloneConfig {
+		return errors.New("full bundle must use updateKind full or config-only")
 	}
 	if bundleType == "delta" && m.UpdateKind == "full" {
 		return errors.New("delta bundle cannot use updateKind full")
@@ -164,6 +165,14 @@ func (m *Manifest) Validate() error {
 	}
 	if bundleType == "delta" && m.UpdateKind == "mixed" && len(m.Images) == 0 {
 		return errors.New("mixed delta must carry at least one image artifact")
+	}
+	if standaloneConfig {
+		if m.SchemaVersion == 3 || m.BaseBundleID != "" || m.BaseRelease != "" || m.BaseManifest != "" || m.AssetsBaseManifest != "" || len(m.RequiredImages) != 0 {
+			return errors.New("standalone config-only bundle cannot contain base metadata")
+		}
+		if len(m.Images) != 0 || m.Payload.ImagesArtifact != "" || m.Payload.ImagesSHA256 != "" || m.Payload.ImagesBytes != 0 {
+			return errors.New("standalone config-only bundle cannot contain encrypted image metadata")
+		}
 	}
 	if m.SchemaVersion < 3 && (bundleType != "full" || m.BaseBundleID != "" || m.BaseRelease != "" || m.BaseManifest != "" || m.AssetsBaseManifest != "" || len(m.RequiredImages) != 0) {
 		return fmt.Errorf("schemaVersion %d does not support delta metadata", m.SchemaVersion)
@@ -186,7 +195,8 @@ func (m *Manifest) Validate() error {
 		"payload.encryption":  m.Payload.Encryption, "signing.algorithm": m.Signing.Algorithm,
 		"signing.keyId": m.Signing.KeyID,
 	}
-	if bundleType == "full" || len(m.Images) > 0 {
+	hasImageMetadata := len(m.Images) > 0 || m.Payload.ImagesArtifact != "" || m.Payload.ImagesSHA256 != "" || m.Payload.ImagesBytes != 0
+	if hasImageMetadata {
 		requiredFields["payload.imagesArtifact"] = m.Payload.ImagesArtifact
 	}
 	for name, value := range requiredFields {
@@ -200,9 +210,12 @@ func (m *Manifest) Validate() error {
 	if strings.TrimSpace(m.Compose.EncryptedSHA256) == "" {
 		return errors.New("encrypted artifact hashes are required")
 	}
-	if m.BundleType == "full" || len(m.Images) > 0 {
+	if hasImageMetadata {
 		if strings.TrimSpace(m.Payload.ImagesArtifact) == "" || strings.TrimSpace(m.Payload.ImagesSHA256) == "" {
 			return errors.New("encrypted image artifact hashes are required")
+		}
+		if m.Payload.ImagesBytes <= 0 {
+			return errors.New("encrypted image artifact size must be positive")
 		}
 	}
 	if m.Payload.Compression != "gzip" && m.Payload.Compression != "none" {
@@ -229,7 +242,7 @@ func (m *Manifest) Validate() error {
 	if m.Binding.Mode == "none" && len(m.Binding.Values) != 0 {
 		return errors.New("binding values are not allowed when binding mode is none")
 	}
-	if len(m.Images) == 0 && bundleType == "full" {
+	if len(m.Images) == 0 && bundleType == "full" && !standaloneConfig {
 		return errors.New("manifest has no images")
 	}
 	if err := validateImages(m.Images, "images"); err != nil {

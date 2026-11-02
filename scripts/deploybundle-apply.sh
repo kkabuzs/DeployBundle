@@ -3,7 +3,8 @@
 # DeployBundle 部署脚本
 #
 # 用途：
-#   先验证签名、哈希、加密流和主机预检，再应用 Bundle。
+#   直接调用 apply，由 apply 验证实际使用的配置、资产和选中的镜像归档。
+#   默认不 load、不 pull、不 build；只有 UPDATE_IMAGES=true 时才准备镜像。
 #   这个脚本不会自动执行 docker compose down，不会删除旧容器、网络或卷。
 #
 # 使用：
@@ -12,8 +13,8 @@
 #   3. 执行：./scripts/deploybundle-apply.sh
 #
 # 回退：
-#   指向旧 Bundle 后重新执行本脚本即可。apply 失败时不会自动回滚已加载镜像
-#   或持久化数据，需要由操作者根据实际状态决定后续处理。
+#   配置回退时指向旧 Bundle；如需回退镜像，另设 UPDATE_IMAGES=true 并准备旧镜像。
+#   apply 失败时不会自动回滚已加载镜像或持久化数据。
 
 set -Eeuo pipefail
 
@@ -31,6 +32,10 @@ VERIFY_KEY="keys/signing.pub"
 
 # 加密 Bundle 中相对 Compose 资产的持久化发布目录。
 ASSETS_DIR="/var/lib/deploybundle/assets"
+
+# true：先 load 包目录中的 images.tar（或旧加密归档）；没有归档时尝试 pull。
+# false：默认只使用已有本地镜像；即使存在 images.tar 也不加载。
+UPDATE_IMAGES="false"
 
 # 留空表示启动 Compose 中全部服务；也可以填写一个或多个服务名。
 # 例如：SERVICES=("piloteye-api" "piloteye-web")
@@ -85,14 +90,12 @@ OPTIONAL_ARGS=()
 
 echo "使用部署工具：$RUN_BIN"
 echo "目标 Bundle：$BUNDLE_PATH"
-echo "开始验证 Bundle……"
-"$RUN_BIN" verify "${COMMON_ARGS[@]}" "${OPTIONAL_ARGS[@]}"
-
 APPLY_ARGS=(apply "${COMMON_ARGS[@]}" --assets-dir "$ASSETS_DIR" "${OPTIONAL_ARGS[@]}")
+[[ "$UPDATE_IMAGES" == "true" ]] && APPLY_ARGS+=(--update-images)
 for service in "${SERVICES[@]}"; do
   APPLY_ARGS+=(--service "$service")
 done
 
-echo "验证通过，开始应用 Bundle……"
+echo "开始验证并应用 Bundle……"
 "$RUN_BIN" "${APPLY_ARGS[@]}"
 echo "Bundle 应用完成：$BUNDLE_PATH"

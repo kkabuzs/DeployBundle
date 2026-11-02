@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -13,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -24,7 +22,6 @@ import (
 	"github.com/openai/deploybundle/internal/assets"
 	"github.com/openai/deploybundle/internal/binding"
 	"github.com/openai/deploybundle/internal/compose"
-	"github.com/openai/deploybundle/internal/docker"
 	"github.com/openai/deploybundle/internal/files"
 	"github.com/openai/deploybundle/internal/keys"
 	"github.com/openai/deploybundle/pkg/bundle"
@@ -65,7 +62,7 @@ func printRootUsage(w io.Writer) {
 
 命令：
   keygen    生成加密密钥和 Ed25519 签名密钥
-  create    从 Compose 读取镜像，生成签名加密 Bundle
+  create    加密 Compose 和可选资产，生成独立签名 Bundle
 
 使用“deploy-pack <命令> --help”查看具体参数说明。`)
 }
@@ -106,14 +103,11 @@ func printCreateUsage(w io.Writer) {
   --env-file PATH           可选，Compose 变量插值用的环境文件
   --package-assets          将 Compose 引用的项目内相对文件一并加密打包
   --compose-profile NAME    启用 Compose profile，可重复指定
-  --base-bundle PATH        基于旧 Bundle 生成只携带变化镜像的增量 Bundle
-  --base-manifest PATH      直接使用旧 Bundle 的 manifest.json 作为增量基线
-  --reuse-images-from PATH  复用完整 Bundle 的加密镜像归档，生成独立完整 Bundle（与增量基线互斥）
-  --bundle-id NAME          稳定的 Bundle 标识；使用增量 Bundle 时必填
+  --bundle-id NAME          稳定的 Bundle 标识；同一服务栈更新时保持不变
   --release VERSION         发布版本，默认 dev
   --profile NAME            运行时 profile，默认 host-integrated-v1
   --platform OS/ARCH        目标平台，默认当前运行平台
-  --compression NAME        镜像归档压缩方式：gzip 或 none，默认 gzip
+  --compression NAME        资产归档压缩方式：gzip 或 none，默认 gzip
   --chunk-size BYTES        加密分块大小，默认 1 MiB
   --bind-mac ADDRESSES      可选，逗号分隔的部署主机 MAC 地址
   --project-name NAME       打包阶段使用的 Compose project 名
@@ -164,9 +158,6 @@ type createOptions struct {
 	bindMACs        string
 	packageAssets   bool
 	composeProfiles stringList
-	baseBundle      string
-	baseManifest    string
-	reuseImagesFrom string
 }
 
 type stringList []string
@@ -205,53 +196,33 @@ func runCreate(args []string) error {
 	fs.StringVar(&o.release, "release", "dev", "release version")
 	fs.StringVar(&o.profile, "profile", "host-integrated-v1", "runtime profile")
 	fs.StringVar(&o.platform, "platform", runtime.GOOS+"/"+runtime.GOARCH, "target OS/architecture")
-	fs.StringVar(&o.compression, "compression", "gzip", "image archive compression: gzip or none")
+	fs.StringVar(&o.compression, "compression", "gzip", "asset archive compression: gzip or none")
 	fs.IntVar(&o.chunkSize, "chunk-size", bundle.DefaultChunkSize, "encrypted stream chunk size")
 	fs.StringVar(&o.bindMACs, "bind-mac", "", "optional comma-separated deployment MAC addresses")
 	fs.BoolVar(&o.packageAssets, "package-assets", false, "package relative Compose config files into an encrypted asset artifact")
 	fs.Var(&o.composeProfiles, "compose-profile", "Compose profile to include in the packaged release model (repeatable)")
-	fs.StringVar(&o.baseBundle, "base-bundle", "", "base bundle directory; create a delta bundle with only changed images")
-	fs.StringVar(&o.baseManifest, "base-manifest", "", "base manifest.json; create a delta bundle without retaining the full base bundle")
-	fs.StringVar(&o.reuseImagesFrom, "reuse-images-from", "", "reuse the encrypted image archive from a complete bundle")
+	removedOptions := map[string]bool{"base-bundle": true, "base-manifest": true, "reuse-images-from": true}
+	for name := range removedOptions {
+		fs.String(name, "", "removed: new bundles contain Compose and optional assets only")
+	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments: %q", fs.Args())
 	}
+	removed := ""
+	fs.Visit(func(f *flag.Flag) {
+		if removedOptions[f.Name] && removed == "" {
+			removed = f.Name
+		}
+	})
+	if removed != "" {
+		return fmt.Errorf("--%s has been removed: create now encrypts standalone Compose and optional assets; supply images.tar separately when needed", removed)
+	}
 	for name, value := range map[string]string{"--compose": o.composePath, "--out": o.outDir, "--key-file": o.keyFile, "--signing-key": o.signingKey} {
 		if value == "" {
 			return fmt.Errorf("%s is required", name)
-		}
-	}
-	if o.baseBundle != "" && o.bundleID == "" {
-		return errors.New("--bundle-id is required when --base-bundle is used")
-	}
-	if o.baseManifest != "" && o.bundleID == "" {
-		return errors.New("--bundle-id is required when --base-manifest is used")
-	}
-	if o.baseBundle != "" && o.baseManifest != "" {
-		return errors.New("--base-bundle and --base-manifest are mutually exclusive")
-	}
-	if (o.baseBundle != "" || o.baseManifest != "") && o.reuseImagesFrom != "" {
-		return errors.New("--base-bundle/--base-manifest and --reuse-images-from are mutually exclusive")
-	}
-	if o.baseManifest != "" {
-		info, err := os.Stat(o.baseManifest)
-		if err != nil {
-			return fmt.Errorf("--base-manifest: %w", err)
-		}
-		if info.IsDir() {
-			return fmt.Errorf("--base-manifest must be a file: %s", o.baseManifest)
-		}
-	}
-	if o.reuseImagesFrom != "" {
-		info, err := os.Stat(o.reuseImagesFrom)
-		if err != nil {
-			return fmt.Errorf("--reuse-images-from: %w", err)
-		}
-		if !info.IsDir() {
-			return fmt.Errorf("--reuse-images-from must be a bundle directory: %s", o.reuseImagesFrom)
 		}
 	}
 	if o.envFile != "" {
@@ -285,71 +256,6 @@ func runCreate(args []string) error {
 }
 
 func createBundle(ctx context.Context, o createOptions, key []byte, privateKey ed25519.PrivateKey, platform bundle.TargetPlatform) error {
-	var base *bundle.Manifest
-	var reused *bundle.Manifest
-	baseDigest := ""
-	basePath := o.baseBundle
-	if o.baseManifest != "" {
-		basePath = o.baseManifest
-	}
-	if basePath != "" {
-		var err error
-		base, err = readBundleManifest(basePath)
-		if err != nil {
-			return fmt.Errorf("read base manifest: %w", err)
-		}
-		if base.BundleID != o.bundleID {
-			return fmt.Errorf("base bundleId %q does not match requested bundleId %q", base.BundleID, o.bundleID)
-		}
-		if base.TargetPlatform != platform {
-			return fmt.Errorf("base bundle platform %s/%s does not match requested platform %s/%s", base.TargetPlatform.OS, base.TargetPlatform.Architecture, platform.OS, platform.Architecture)
-		}
-		digest, err := bundle.ManifestDigest(base)
-		if err != nil {
-			return fmt.Errorf("digest base manifest: %w", err)
-		}
-		baseDigest = "sha256:" + hex.EncodeToString(digest[:])
-	}
-	if o.reuseImagesFrom != "" {
-		var err error
-		reused, err = readBundleManifest(o.reuseImagesFrom)
-		if err != nil {
-			return fmt.Errorf("read image reuse bundle: %w", err)
-		}
-		if reused.BundleType != "" && reused.BundleType != "full" {
-			return fmt.Errorf("image reuse bundle must be complete, got bundleType %q", reused.BundleType)
-		}
-		if reused.TargetPlatform != platform {
-			return fmt.Errorf("image reuse bundle platform %s/%s does not match requested platform %s/%s", reused.TargetPlatform.OS, reused.TargetPlatform.Architecture, platform.OS, platform.Architecture)
-		}
-		if reused.Payload.Compression != o.compression {
-			return fmt.Errorf("image reuse bundle compression %q does not match requested compression %q", reused.Payload.Compression, o.compression)
-		}
-		if reused.Payload.ChunkSize != o.chunkSize {
-			return fmt.Errorf("image reuse bundle chunk size %d does not match requested chunk size %d", reused.Payload.ChunkSize, o.chunkSize)
-		}
-		if strings.TrimSpace(reused.Payload.ImagesArtifact) == "" {
-			return errors.New("image reuse bundle has no encrypted image artifact")
-		}
-	}
-	// A new Bundle uses the original Compose image reference as its runtime
-	// tag. When extending a legacy Bundle that used bundle.local/<id> tags,
-	// preserve the previous tag for unchanged images so configuration-only
-	// updates remain compatible with images already loaded on the target host.
-	previousImages := make(map[string]bundle.ImageArtifact)
-	if base != nil {
-		baseImages := base.Images
-		if base.BundleType == "delta" && len(base.RequiredImages) > 0 {
-			baseImages = base.RequiredImages
-		}
-		for _, image := range baseImages {
-			previousImages[image.Service] = image
-		}
-	} else if reused != nil {
-		for _, image := range reused.Images {
-			previousImages[image.Service] = image
-		}
-	}
 	sourceCompose, err := os.ReadFile(o.composePath)
 	if err != nil {
 		return err
@@ -371,77 +277,14 @@ func createBundle(ctx context.Context, o createOptions, key []byte, privateKey e
 		}
 	}
 	assetManifest := assetManifests(sources)
-	serviceNames := make([]string, 0, len(services))
-	for name := range services {
-		serviceNames = append(serviceNames, name)
-	}
-	sort.Strings(serviceNames)
-	images := make([]bundle.ImageArtifact, 0, len(services))
-	for _, service := range serviceNames {
-		serviceValue, ok := services[service].(map[string]any)
+	for name, value := range services {
+		service, ok := value.(map[string]any)
 		if !ok {
-			return fmt.Errorf("service %q has an invalid object", service)
+			return fmt.Errorf("service %q has an invalid object", name)
 		}
-		ref, ok := serviceValue["image"].(string)
+		ref, ok := service["image"].(string)
 		if !ok || strings.TrimSpace(ref) == "" {
-			return fmt.Errorf("service %q has no image; build-only services are not supported by this MVP", service)
-		}
-		inspect, err := docker.Inspect(ctx, o.dockerBin, ref)
-		if err != nil {
-			return err
-		}
-		if inspect.OS != "" && inspect.OS != platform.OS {
-			return fmt.Errorf("service %q image %q targets OS %s, but bundle platform is %s", service, ref, inspect.OS, platform.OS)
-		}
-		if inspect.Architecture != "" && inspect.Architecture != platform.Architecture {
-			return fmt.Errorf("service %q image %q targets architecture %s, but bundle platform is %s", service, ref, inspect.Architecture, platform.Architecture)
-		}
-		runtimeTag := ref
-		if previous, ok := previousImages[service]; ok &&
-			previous.LocalImageID == inspect.ID && previous.OriginalRef == ref &&
-			strings.TrimSpace(previous.LocalTag) != "" {
-			runtimeTag = previous.LocalTag
-		}
-		serviceValue["image"] = runtimeTag
-		serviceValue["pull_policy"] = "never"
-		sourceDigest := "local:" + inspect.ID
-		if len(inspect.RepoDigests) > 0 {
-			sourceDigest = inspect.RepoDigests[0]
-		}
-		images = append(images, bundle.ImageArtifact{
-			Service: service, OriginalRef: ref, SourceRepoDigest: sourceDigest,
-			LocalImageID: inspect.ID, RootfsDiffIDs: append([]string(nil), inspect.RootFS.Layers...), LocalTag: runtimeTag,
-		})
-	}
-	includedImages := images
-	if base != nil {
-		baseImages := base.Images
-		if base.BundleType == "delta" && len(base.RequiredImages) > 0 {
-			baseImages = base.RequiredImages
-		}
-		baseByService := make(map[string]bundle.ImageArtifact, len(baseImages))
-		for _, image := range baseImages {
-			baseByService[image.Service] = image
-		}
-		includedImages = make([]bundle.ImageArtifact, 0, len(images))
-		for _, image := range images {
-			previous, ok := baseByService[image.Service]
-			if !ok || previous.LocalImageID != image.LocalImageID || previous.LocalTag != image.LocalTag {
-				includedImages = append(includedImages, image)
-			}
-		}
-	}
-	if reused != nil {
-		if err := validateReusableImages(images, reused.Images); err != nil {
-			return err
-		}
-	}
-	assetsBaseManifest := ""
-	if base != nil && len(assetManifest) > 0 && sameAssetManifests(assetManifest, base.Assets) {
-		if base.Payload.AssetsArtifact != "" {
-			assetsBaseManifest = baseDigest
-		} else {
-			assetsBaseManifest = base.AssetsBaseManifest
+			return fmt.Errorf("service %q has no image; build-only services are not supported", name)
 		}
 	}
 	canonicalCompose, err := bundle.MarshalCanonical(config)
@@ -475,35 +318,8 @@ func createBundle(ctx context.Context, o createOptions, key []byte, privateKey e
 	if err := encryptBytes(composeArtifact, canonicalCompose, key, o.chunkSize); err != nil {
 		return err
 	}
-	imagesName := ""
-	if len(includedImages) > 0 {
-		if reused != nil {
-			imagesName = reused.Payload.ImagesArtifact
-			reusedImagesPath := filepath.Join(o.reuseImagesFrom, imagesName)
-			reusedHash, reusedBytes, err := files.SHA256(reusedImagesPath)
-			if err != nil {
-				return fmt.Errorf("hash reused encrypted image artifact: %w", err)
-			}
-			if reusedHash != reused.Payload.ImagesSHA256 || reusedBytes != reused.Payload.ImagesBytes {
-				return fmt.Errorf("image reuse artifact hash or size does not match its manifest")
-			}
-			if err := copyFile(reusedImagesPath, filepath.Join(stage, imagesName)); err != nil {
-				return fmt.Errorf("reuse encrypted image artifact: %w", err)
-			}
-		} else {
-			imagesName = "images.tar." + o.compression + ".enc"
-			imagesArtifact := filepath.Join(stage, imagesName)
-			includedTags := make([]string, 0, len(includedImages))
-			for _, image := range includedImages {
-				includedTags = append(includedTags, image.LocalTag)
-			}
-			if err := saveImages(ctx, o.dockerBin, includedTags, imagesArtifact, o.compression, key, o.chunkSize); err != nil {
-				return err
-			}
-		}
-	}
 	assetsName := ""
-	if len(sources) > 0 && assetsBaseManifest == "" {
+	if len(sources) > 0 {
 		assetsName = "assets.tar." + o.compression + ".enc"
 		if err := saveAssets(filepath.Join(stage, assetsName), sources, o.compression, key, o.chunkSize); err != nil {
 			return err
@@ -512,14 +328,6 @@ func createBundle(ctx context.Context, o createOptions, key []byte, privateKey e
 	composeHash, composeBytes, err := files.SHA256(composeArtifact)
 	if err != nil {
 		return err
-	}
-	imageHash := ""
-	var imageBytes int64
-	if imagesName != "" {
-		imageHash, imageBytes, err = files.SHA256(filepath.Join(stage, imagesName))
-		if err != nil {
-			return err
-		}
 	}
 	assetHash := ""
 	var assetBytes int64
@@ -530,8 +338,8 @@ func createBundle(ctx context.Context, o createOptions, key []byte, privateKey e
 		}
 	}
 	payload := bundle.PayloadSpec{
-		ComposeArtifact: "compose.enc", ImagesArtifact: imagesName, ImagesSHA256: imageHash, ImagesBytes: imageBytes,
-		Compression: o.compression, Encryption: bundle.EncryptionName, ChunkSize: o.chunkSize,
+		ComposeArtifact: "compose.enc",
+		Compression:     o.compression, Encryption: bundle.EncryptionName, ChunkSize: o.chunkSize,
 	}
 	if assetsName != "" {
 		payload.AssetsArtifact = assetsName
@@ -541,34 +349,16 @@ func createBundle(ctx context.Context, o createOptions, key []byte, privateKey e
 	// Artifact hashes are included in the manifest so a runner can reject a
 	// replaced file before spending time decrypting or invoking Docker.
 	manifest := &bundle.Manifest{
-		SchemaVersion: 1, BundleType: "full", BundleID: o.bundleID, ReleaseVersion: o.release,
+		SchemaVersion: 1, BundleType: "full", UpdateKind: "config-only", BundleID: o.bundleID, ReleaseVersion: o.release,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339), Profile: o.profile,
 		TargetPlatform: platform,
 		Compose:        bundle.ComposeArtifact{SourceSHA256: sourceHash, PackagedSHA256: packagedHash, Bytes: int64(len(canonicalCompose)), Artifact: "compose.enc", EncryptedSHA256: composeHash, EncryptedBytes: composeBytes},
-		Images:         includedImages, Assets: assetManifest, Capabilities: capabilities, Binding: macBinding,
-		AssetsBaseManifest: assetsBaseManifest,
-		Payload:            payload,
-		Signing:            bundle.SigningSpec{Algorithm: "Ed25519", KeyID: keyID(privateKey)},
+		Images:         []bundle.ImageArtifact{}, Assets: assetManifest, Capabilities: capabilities, Binding: macBinding,
+		Payload: payload,
+		Signing: bundle.SigningSpec{Algorithm: "Ed25519", KeyID: keyID(privateKey)},
 	}
-	if base != nil {
-		manifest.SchemaVersion = 3
-		manifest.BundleType = "delta"
-		manifest.BaseBundleID = base.BundleID
-		manifest.BaseRelease = base.ReleaseVersion
-		manifest.BaseManifest = baseDigest
-		manifest.RequiredImages = images
-	}
-	// Schema 2 is used for full bundles with assets. Delta bundles stay on
-	// schema 3 even when they carry an encrypted asset artifact.
-	if assetsName != "" && base == nil {
+	if assetsName != "" {
 		manifest.SchemaVersion = 2
-	}
-	if base == nil {
-		manifest.UpdateKind = "full"
-	} else if len(includedImages) == 0 {
-		manifest.UpdateKind = "config-only"
-	} else {
-		manifest.UpdateKind = "mixed"
 	}
 	if err := manifest.Validate(); err != nil {
 		return err
@@ -590,36 +380,8 @@ func createBundle(ctx context.Context, o createOptions, key []byte, privateKey e
 	if err := os.Rename(stage, o.outDir); err != nil {
 		return fmt.Errorf("publish bundle: %w", err)
 	}
-	fmt.Printf("created DeployBundle %s (%s, %d images, %d carried)\n", o.outDir, manifest.UpdateKind, len(images), len(includedImages))
-	if imagesName != "" {
-		fmt.Printf("  images: %s\n", filepath.Join(o.outDir, imagesName))
-	}
-	if assetsBaseManifest != "" {
-		fmt.Printf("  assets: reused from %s\n", assetsBaseManifest)
-	}
+	fmt.Printf("created DeployBundle %s (config-only)\n", o.outDir)
 	fmt.Printf("  manifest: %s\n  compose: %s (%d bytes)\n", filepath.Join(o.outDir, "manifest.json"), filepath.Join(o.outDir, "compose.enc"), composeBytes)
-	return nil
-}
-
-func validateReusableImages(current, reusable []bundle.ImageArtifact) error {
-	if len(current) != len(reusable) {
-		return fmt.Errorf("image reuse bundle has %d images, current Compose has %d", len(reusable), len(current))
-	}
-	byService := make(map[string]bundle.ImageArtifact, len(reusable))
-	for _, image := range reusable {
-		byService[image.Service] = image
-	}
-	for _, image := range current {
-		previous, ok := byService[image.Service]
-		if !ok {
-			return fmt.Errorf("image reuse bundle is missing service %q", image.Service)
-		}
-		if previous.OriginalRef != image.OriginalRef || previous.SourceRepoDigest != image.SourceRepoDigest ||
-			previous.LocalImageID != image.LocalImageID || previous.LocalTag != image.LocalTag ||
-			!stringSlicesEqual(previous.RootfsDiffIDs, image.RootfsDiffIDs) {
-			return fmt.Errorf("image metadata for service %q differs from reuse bundle; use the matching full Bundle", image.Service)
-		}
-	}
 	return nil
 }
 
@@ -632,63 +394,6 @@ func assetManifests(sources []assets.Source) []bundle.AssetArtifact {
 		result = append(result, source.Manifest)
 	}
 	return result
-}
-
-func sameAssetManifests(a, b []bundle.AssetArtifact) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func stringSlicesEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	return out.Close()
-}
-
-func readBundleManifest(dir string) (*bundle.Manifest, error) {
-	path := dir
-	if info, err := os.Stat(dir); err == nil && info.IsDir() {
-		path = filepath.Join(dir, "manifest.json")
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	m, err := bundle.ParseManifest(raw)
-	if err != nil {
-		return nil, err
-	}
-	return m, nil
 }
 
 func makeMACBinding(value string) (bundle.Binding, error) {
@@ -714,65 +419,6 @@ func encryptBytes(path string, data, key []byte, chunkSize int) error {
 		return encryptErr
 	}
 	return closeErr
-}
-
-func saveImages(ctx context.Context, dockerBin string, tags []string, output, compression string, key []byte, chunkSize int) error {
-	f, err := os.OpenFile(output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return err
-	}
-	args := append([]string{"save"}, tags...)
-	cmd := exec.CommandContext(ctx, dockerBin, args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		_ = f.Close()
-		return err
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("start docker save: %w", err)
-	}
-	pr, pw := io.Pipe()
-	streamDone := make(chan error, 1)
-	go func() {
-		var streamErr error
-		if compression == "gzip" {
-			gz := gzip.NewWriter(pw)
-			_, streamErr = io.Copy(gz, stdout)
-			if closeErr := gz.Close(); streamErr == nil {
-				streamErr = closeErr
-			}
-		} else {
-			_, streamErr = io.Copy(pw, stdout)
-		}
-		pw.CloseWithError(streamErr)
-		streamDone <- streamErr
-	}()
-	encryptErr := bundle.Encrypt(f, pr, key, bundle.WithChunkSize(chunkSize))
-	if encryptErr != nil {
-		// Unblock the producer before waiting for it. Without closing the read
-		// side, a producer can remain blocked on the pipe after an output error.
-		_ = pr.CloseWithError(encryptErr)
-		_ = cmd.Process.Kill()
-	}
-	closeErr := f.Close()
-	waitErr := cmd.Wait()
-	streamErr := <-streamDone
-	if encryptErr != nil {
-		return fmt.Errorf("encrypt image archive: %w", encryptErr)
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if streamErr != nil {
-		return fmt.Errorf("read docker save stream: %w", streamErr)
-	}
-	if waitErr != nil {
-		return fmt.Errorf("docker save failed: %w: %s", waitErr, stderr.String())
-	}
-	return nil
 }
 
 func parsePlatform(value string) (bundle.TargetPlatform, error) {

@@ -118,12 +118,13 @@ func printApplyUsage(w io.Writer) {
   --verify-key PATH         Ed25519 验签公钥
   --assets-dir PATH         持久化 Compose 资产根目录，默认 /var/lib/deploybundle/assets
   --service NAME            只启动指定 Compose 服务，可重复指定
+  --update-images           更新镜像：优先加载 images.tar；无归档时尝试 pull
   --allow-platform-mismatch 允许 Bundle 目标平台与当前主机不同
   --skip-host-preflight     跳过 GPU、设备和宿主机路径预检
   --docker PATH             Docker CLI 路径，默认 docker
   -h, --help                显示此帮助
 
-说明：apply 会先完整验证并解密 Bundle，再加载镜像并启动 Compose；不会比较客户机已有镜像 ID；失败时不会自动删除已加载镜像或回滚持久化数据。`)
+说明：默认只使用本地镜像更新配置，不 load、不 pull、不 build。加 --update-images 才准备镜像；pull 失败时警告并尝试本地镜像。失败时不会自动回滚镜像或持久化数据。`)
 }
 
 type runOptions struct {
@@ -133,6 +134,7 @@ type runOptions struct {
 	dockerBin     string
 	assetsDir     string
 	services      stringList
+	updateImages  bool
 	allowPlatform bool
 	skipHostCheck bool
 }
@@ -165,6 +167,7 @@ func parseRunOptions(args []string, command string, needSecret bool) (runOptions
 	if command == "apply" {
 		fs.StringVar(&o.assetsDir, "assets-dir", "/var/lib/deploybundle/assets", "persistent root for packaged Compose assets")
 		fs.Var(&o.services, "service", "Compose service to start (repeatable)")
+		fs.BoolVar(&o.updateImages, "update-images", false, "load bundled images or pull before starting Compose")
 	}
 	fs.BoolVar(&o.allowPlatform, "allow-platform-mismatch", false, "allow manifest target platform to differ from runtime")
 	fs.BoolVar(&o.skipHostCheck, "skip-host-preflight", false, "skip GPU/device/path preflight")
@@ -270,7 +273,7 @@ func runApply(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := verifyArtifactHashes(m, o.bundleDir); err != nil {
+	if err := verifySelectedArtifactHashes(m, o.bundleDir, false); err != nil {
 		return err
 	}
 	composeBytes, err := decryptCompose(m, o.bundleDir, key)
@@ -284,16 +287,21 @@ func runApply(args []string) error {
 		return err
 	}
 	var imageArchive *os.File
-	if len(m.Images) > 0 {
-		imageArchive, err = materializeImages(m, o.bundleDir, key)
+	if o.updateImages {
+		var temporary bool
+		imageArchive, temporary, err = prepareImageArchive(m, o.bundleDir, key)
 		if err != nil {
-			return fmt.Errorf("decrypt image archive preflight: %w", err)
+			return fmt.Errorf("prepare image archive: %w", err)
 		}
-		defer func() {
-			name := imageArchive.Name()
-			_ = imageArchive.Close()
-			_ = os.Remove(name)
-		}()
+		if imageArchive != nil {
+			defer func() {
+				name := imageArchive.Name()
+				_ = imageArchive.Close()
+				if temporary {
+					_ = os.Remove(name)
+				}
+			}()
+		}
 	}
 	workingDir := ""
 	if len(m.Assets) > 0 {
@@ -313,15 +321,24 @@ func runApply(args []string) error {
 			return err
 		}
 	}
+	usedLocalFallback := false
 	if imageArchive != nil {
 		if err := loadImages(context.Background(), imageArchive, o.dockerBin); err != nil {
 			return err
+		}
+	} else if o.updateImages {
+		if err := pullCompose(context.Background(), m, composeBytes, o.dockerBin, workingDir, o.services); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: 镜像拉取失败，尝试使用本地镜像；不能确认镜像已更新：%v\n", err)
+			usedLocalFallback = true
 		}
 	}
 	if err := startCompose(context.Background(), m, composeBytes, o.dockerBin, workingDir, o.services); err != nil {
 		return err
 	}
 	fmt.Printf("bundle %s applied\n", m.BundleID)
+	if usedLocalFallback {
+		fmt.Println("配置已应用，使用本地镜像；不能确认镜像已更新")
+	}
 	return nil
 }
 
@@ -424,6 +441,10 @@ func verifyArtifacts(m *bundle.Manifest, dir string, key []byte) error {
 }
 
 func verifyArtifactHashes(m *bundle.Manifest, dir string) error {
+	return verifySelectedArtifactHashes(m, dir, true)
+}
+
+func verifySelectedArtifactHashes(m *bundle.Manifest, dir string, includeImages bool) error {
 	composePath, err := artifactPath(dir, m.Payload.ComposeArtifact)
 	if err != nil {
 		return err
@@ -435,7 +456,7 @@ func verifyArtifactHashes(m *bundle.Manifest, dir string) error {
 	if composeHash != m.Compose.EncryptedSHA256 || composeBytes != m.Compose.EncryptedBytes {
 		return errors.New("encrypted Compose artifact hash or length does not match manifest")
 	}
-	if m.Payload.ImagesArtifact != "" {
+	if includeImages && m.Payload.ImagesArtifact != "" {
 		imagesPath, err := artifactPath(dir, m.Payload.ImagesArtifact)
 		if err != nil {
 			return err
@@ -669,6 +690,28 @@ func materializeImages(m *bundle.Manifest, dir string, key []byte) (*os.File, er
 	return tmp, nil
 }
 
+// New configuration bundles may carry an ordinary docker save archive. Legacy
+// encrypted archives remain readable only when image updates are requested.
+func prepareImageArchive(m *bundle.Manifest, dir string, key []byte) (*os.File, bool, error) {
+	path := filepath.Join(dir, "images.tar")
+	info, err := os.Lstat(path)
+	if err == nil {
+		if !info.Mode().IsRegular() {
+			return nil, false, errors.New("images.tar must be a regular file")
+		}
+		f, err := os.Open(path)
+		return f, false, err
+	}
+	if !os.IsNotExist(err) {
+		return nil, false, err
+	}
+	if m.Payload.ImagesArtifact != "" {
+		f, err := materializeImages(m, dir, key)
+		return f, true, err
+	}
+	return nil, false, nil
+}
+
 func loadImages(ctx context.Context, archive *os.File, dockerBin string) error {
 	cmd := exec.CommandContext(ctx, dockerBin, "load")
 	stdin, err := cmd.StdinPipe()
@@ -693,14 +736,30 @@ func loadImages(ctx context.Context, archive *os.File, dockerBin string) error {
 	return nil
 }
 
-func startCompose(ctx context.Context, m *bundle.Manifest, composeBytes []byte, dockerBin, projectDirectory string, services []string) error {
-	project := sanitizeProject(m.BundleID)
-	args := []string{"compose", "--project-name", project}
+func composeArgs(m *bundle.Manifest, projectDirectory string) []string {
+	args := []string{"compose", "--project-name", sanitizeProject(m.BundleID)}
 	if projectDirectory != "" {
 		args = append(args, "--project-directory", projectDirectory)
 	}
-	args = append(args, "-f", "-", "up", "-d", "--pull", "never")
+	return append(args, "-f", "-")
+}
+
+func pullCompose(ctx context.Context, m *bundle.Manifest, composeBytes []byte, dockerBin, projectDirectory string, services []string) error {
+	args := append(composeArgs(m, projectDirectory), "pull", "--policy", "always")
+	if len(services) > 0 {
+		args = append(args, "--include-deps")
+	}
 	args = append(args, services...)
+	return runCompose(ctx, m, composeBytes, dockerBin, args, "pull")
+}
+
+func startCompose(ctx context.Context, m *bundle.Manifest, composeBytes []byte, dockerBin, projectDirectory string, services []string) error {
+	args := append(composeArgs(m, projectDirectory), "up", "-d", "--pull", "never", "--no-build")
+	args = append(args, services...)
+	return runCompose(ctx, m, composeBytes, dockerBin, args, "up")
+}
+
+func runCompose(ctx context.Context, m *bundle.Manifest, composeBytes []byte, dockerBin string, args []string, action string) error {
 	cmd := exec.CommandContext(ctx, dockerBin, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -708,7 +767,7 @@ func startCompose(ctx context.Context, m *bundle.Manifest, composeBytes []byte, 
 	}
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start docker compose: %w", err)
+		return fmt.Errorf("start docker compose %s: %w", action, err)
 	}
 	h := sha256.New()
 	_, writeErr := io.Copy(io.MultiWriter(stdin, h), bytes.NewReader(composeBytes))
@@ -724,7 +783,7 @@ func startCompose(ctx context.Context, m *bundle.Manifest, composeBytes []byte, 
 		return errors.New("decrypted Compose hash changed before apply")
 	}
 	if waitErr != nil {
-		return fmt.Errorf("docker compose failed: %w", waitErr)
+		return fmt.Errorf("docker compose %s failed: %w", action, waitErr)
 	}
 	return nil
 }
